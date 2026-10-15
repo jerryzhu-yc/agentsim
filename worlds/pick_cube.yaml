@@ -1,0 +1,43 @@
+name: pick_cube
+timestep: 0.002        # 物理步长（秒）
+ctrl_period: 32        # 一个控制 tick 的物理步数
+gravity: [0, 0, -9.81]
+
+scene:
+  floor:
+    size: [2.0, 2.0]
+    texture: grid
+    friction: 0.3      # 低摩擦地面：cube 可被指板推行（接触摩擦取 max，需双方都低）
+  lights:
+    - {pos: [0, 0, 3]}
+  objects:
+    # 地面立柱 cube（6x7x10cm）：j1 侧扫推式任务的目标物。
+    # 放在 (0.635, 0.15)：半径 0.613~0.687，恰在指板径向展幅 [0.592, 0.692]
+    # 内、又在腕本体最大半径 0.598 之外 —— 全程只有指板碰得到它
+    - name: cube
+      type: box
+      size: [0.03, 0.035, 0.05]
+      pos: [0.635, 0.15, 0.05]
+      mass: 0.05
+      friction: 0.3
+      color: "#F59E0B"
+
+robots:
+  - name: arm
+    model: ../models/demo_arm.xml
+    pos: [0, 0, 0]
+    controller: ../controllers/pick_place.py   # 侧扫推式相位机
+
+task:
+  success:                              # cube 被指板侧扫推入 y>0.25 区域
+    body: cube
+    zone: {min: [0.35, 0.25, 0.0], max: [0.65, 0.50, 0.12]}
+  reward:
+    - distance: {a: cube, b: wrist, weight: -0.01}
+    - zone: {body: cube, zone: {min: [0.35, 0.25, 0.0], max: [0.65, 0.50, 0.12]}, weight: 0.01}
+  max_ticks: 5000
+
+runtime:
+  realtime: false
+  controller_timeout: 100
+  timeout_policy: last_ctrl

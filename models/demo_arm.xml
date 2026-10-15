@@ -1,0 +1,48 @@
+<mujoco model="demo_arm">
+  <!-- 演示机械臂：3 关节 + 平行夹爪。
+       纯机器人模型：不含地面/灯光/场景物体，那些由世界 YAML 提供。
+       关节/执行器参数已在 mini_robot_sim 项目中实测调优（kp/kv/ctrlrange）。 -->
+  <compiler angle="radian"/>
+  <option timestep="0.002"/>
+
+  <worldbody>
+    <body name="base" pos="0 0 0.05">
+      <geom name="base_geom" type="cylinder" size="0.08 0.05" rgba="0.35 0.35 0.4 1"/>
+      <joint name="j1" type="hinge" axis="0 0 1" range="-3.14 3.14" damping="0.5"/>
+
+      <body name="link1" pos="0 0 0.05">
+        <geom type="capsule" size="0.04 0.15" pos="0 0 0.15" rgba="0.8 0.2 0.2 1"/>
+        <joint name="j2" type="hinge" axis="0 1 0" range="-1.57 1.57" damping="0.5"/>
+
+        <body name="link2" pos="0 0 0.32">
+          <geom type="capsule" size="0.03 0.12" pos="0 0 0.12" rgba="0.2 0.7 0.2 1"/>
+          <joint name="j3" type="hinge" axis="0 1 0" range="-1.57 1.57" damping="0.5"/>
+
+          <body name="wrist" pos="0 0 0.26">
+            <geom type="box" size="0.035 0.035 0.02" rgba="0.2 0.2 0.8 1"/>
+
+            <!-- 左夹指：ctrl 越小张得越开（指在腕前方，指间净空 10cm） -->
+            <body name="finger_l" pos="-0.035 0 0.065">
+              <joint name="fl" type="slide" axis="1 0 0" range="-0.03 0" damping="0.1"/>
+              <geom type="box" size="0.008 0.02 0.05" rgba="0.95 0.85 0.2 1"/>
+            </body>
+
+            <!-- 右夹指：ctrl 越大张得越开 -->
+            <body name="finger_r" pos="0.035 0 0.065">
+              <joint name="fr" type="slide" axis="1 0 0" range="0 0.03" damping="0.1"/>
+              <geom type="box" size="0.008 0.02 0.05" rgba="0.95 0.85 0.2 1"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="a1" joint="j1" kp="60" kv="2" ctrlrange="-3.14 3.14"/>
+    <position name="a2" joint="j2" kp="120" kv="3" ctrlrange="-1.57 1.57"/>
+    <position name="a3" joint="j3" kp="60" kv="1.5" ctrlrange="-1.57 1.57"/>
+    <position name="a_l" joint="fl" kp="50" kv="1" ctrlrange="-0.03 0"/>
+    <position name="a_r" joint="fr" kp="50" kv="1" ctrlrange="0 0.03"/>
+  </actuator>
+</mujoco>

@@ -1,0 +1,6 @@
+# AgentSim M0 依赖
+mujoco>=3.2        # 物理引擎 + MjSpec 程序化场景组装
+numpy              # 数值计算
+pyyaml             # 世界文件解析
+pyzmq              # 控制器进程 IPC（ZMQ REQ/ROUTER 栅栏同步）
+pytest             # 开发/测试
