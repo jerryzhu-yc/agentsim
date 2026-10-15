@@ -277,8 +277,13 @@ class Simulation:
 
     # ---------------------------------------------------------------- 主循环
 
-    def run(self, max_ticks: int | None = None) -> dict:
-        """推进仿真，返回统计。max_ticks 缺省用世界 task.max_ticks（再缺省 10000）。"""
+    def run(self, max_ticks: int | None = None,
+            on_tick: "callable | None" = None) -> dict:
+        """推进仿真，返回统计。max_ticks 缺省用世界 task.max_ticks（再缺省 10000）。
+
+        on_tick(tick)：每个控制 tick 推进后的回调（GUI/MCP 用来抽观测快照）。
+        回调在同一线程内同步调用，此时 data 处于一致状态，可安全读取。
+        """
         if max_ticks is None:
             max_ticks = self.spec.task.max_ticks
         if max_ticks is None:
@@ -294,6 +299,8 @@ class Simulation:
                 for _ in range(self.spec.ctrl_period):
                     mujoco.mj_step(self.model, self.data)
                 self.tick += 1
+                if on_tick is not None:
+                    on_tick()
             return self._stats(t_start, sim_start)
 
         # 等所有控制器完成握手（进程死光则放弃等待）
@@ -316,6 +323,8 @@ class Simulation:
                 continue
             if self._barrier_ready():
                 self._advance(budget=max_ticks - self.tick)
+                if on_tick is not None:
+                    on_tick()
             elif policy == "last_ctrl" and not got_msg:
                 # 只在真超时（队列空）时补位，队列里还有消息就继续收
                 for name in parts:

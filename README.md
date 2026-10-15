@@ -40,7 +40,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 要求 Python 3.10+。
 
 ```bash
-git clone <本仓库地址>
+git clone https://github.com/jerryzhu-yc/agentsim.git
 cd agentsim
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -202,7 +202,7 @@ agentsim/
 ## Roadmap
 
 - [x] M0 仿真内核（物理 / 进程隔离 / Supervisor / MCP / 场景生成，71 项测试）
-- [ ] M1 GUI（PySide6 可视化 + 实时观测面板）
+- [ ] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染，内核已备好 `run(on_tick=)` 观测钩子
 - [ ] M1 心跳机制（内核崩溃时控制器可感知退出）
 - [ ] 更多机器人模型与传感器（关节力矩、触觉、相机）
 - [ ] RL 训练接口（gym.Env 封装）
