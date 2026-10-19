@@ -11,7 +11,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
         └───────────────┬──────────────────────────────┘
                         │ stdio JSON-RPC (MCP)
         ┌───────────────▼──────────────────────────────┐
-        │           MCP 工具层（8 个工具）              │
+        │           MCP 工具层（9 个工具）              │
         │  load_world / run / get_observation / ...    │
         └───────────────┬──────────────────────────────┘
                         │
@@ -30,7 +30,8 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 
 - **World as Code**：一份 YAML 描述物理、机器人、任务、奖励，字段语义与 MJCF 对齐（`size`=半尺寸、`pos`=中心），有 MuJoCo 经验即可直接上手；错误信息带字段路径、期望值、实际值，人和 AI 都能直接看懂
 - **进程级控制器隔离**：每个机器人的控制器是独立 OS 进程，通过 ZMQ REQ/ROUTER 与内核栅栏同步；控制器崩溃、超时都不会死锁内核
-- **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真
+- **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真，包括让 Agent 用 `screenshot` 截取仿真画面"亲眼"看世界
+- **传感器系统**：YAML 里给机器人声明 encoder / IMU / 触觉 / 关节力矩 / 相机五类传感器，编译进 MuJoCo 模型、读数进观测流，GUI 面板实时显示；传感器是只读派生量，不改变物理轨迹（bit 级守护测试保证）
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
 - **场景生成器**：5 个确定性模板（tabletop / push / maze / race / empty），同一命令 + 同一参数 = 逐字节相同的输出
 - **零重量依赖**：核心只依赖 mujoco / numpy / pyyaml / pyzmq，MCP 层不依赖任何 SDK
@@ -72,14 +73,15 @@ python -m agentsim run worlds/pick_cube.yaml
 python -m agentsim mcp
 ```
 
-在支持 MCP 的客户端里把它注册为 stdio 服务器，Agent 即可使用 8 个工具完成闭环：
+在支持 MCP 的客户端里把它注册为 stdio 服务器，Agent 即可使用 9 个工具完成闭环：
 
 | 工具 | 说明 |
 |---|---|
 | `load_world` | 加载世界（`yaml_path` 或 `yaml_text` 二选一），整体替换当前世界 |
 | `run` | 推进仿真并返回摘要（ticks / success / reward / 物体终位）；`ticks=N` 只推进 N 步 |
-| `get_observation` | 当前完整观察量：qpos / qvel / ctrl / body 位置 + 任务状态 |
-| `get_robot_manifest` | 机器人设备清单：执行器、关节限位、body 名 |
+| `get_observation` | 当前完整观察量：qpos / qvel / ctrl / body 位置 + 传感器读数 + 任务状态 |
+| `get_robot_manifest` | 机器人设备清单：执行器、关节限位、body 名、传感器、相机 |
+| `screenshot` | 把当前状态渲染成 PNG：缺省自由机位返回 image content，`camera` 指定已声明相机，`path` 写盘 |
 | `save_state` / `load_state` | 内存快照，物理状态逐位恢复 |
 | `reset` | 世界回到 YAML 初态（重编译 + 控制器进程重启） |
 | `read_world` | 回读当前世界的 YAML 原文 |
@@ -151,6 +153,13 @@ robots:
     model: ../models/demo_arm.xml   # MJCF 路径（相对本文件）
     pos: [0, 0, 0]
     controller: ../controllers/pick_place.py   # 控制器脚本（相对本文件）
+    sensors:                         # 可选：五类传感器，编译进 MuJoCo
+      - {name: j1_enc, type: encoder, joint: j1}          # 关节位置
+      - {name: j1_tau, type: joint_torque, joint: j1}     # 关节约束力
+      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}   # 6 维
+      - {name: fl_touch, type: tactile, body: finger_l, pos: [0, 0, 0]}
+      - {name: gripper_cam, type: camera, body: wrist,
+         pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}
 
 task:
   success:                  # 成功判定：body 位置落入 zone
@@ -169,6 +178,13 @@ runtime:
 
 命名引用规则：物体名全局唯一；机器人 body 自动带机器人前缀（`arm/wrist`）。当机器人名与其 body 名不同时，任务里引用必须写全名（如 `car_a/car`）；同名时可用短名。
 
+传感器说明：
+
+- **类型与挂点**：`encoder` / `joint_torque` 挂 `joint`；`imu` / `tactile` / `camera` 挂 `body`（`pos` 为 body 局部系挂点偏移，`quat` 仅 camera 用于朝向）
+- **读数进观测流**：obs 里 `sensors` 键为 `{名字: 读数}`，标量（encoder/joint_torque/tactile）是 float，IMU 是 6 维列表 `[陀螺 xyz, 加速度 xyz]`；相机不产生数值读数，只作 `screenshot` 的 viewpoint
+- **tactile 的 `radius`**：MuJoCo 3.x 的 touch 只统计接触点落在以挂点为球心、`radius` 为半径的球内的接触力——`radius` 要罩住挂点 body 的预期接触区，默认 0.06（约指尖/指板整面大小）
+- **实现映射**：encoder→JOINTPOS、joint_torque→JOINTACTFRC、imu→GYRO+ACCELEROMETER、tactile→TOUCH 标量（不是需要 plugin 的 mjSENS_TACTILE 网格阵列）；传感器是只读派生量，加不加传感器物理轨迹逐位一致（有 bit 级守护测试）
+
 ## 控制器 API（Webots 风格）
 
 控制器是普通 Python 脚本，唯一要 import 的东西是 `Robot`：
@@ -182,6 +198,8 @@ while robot.step():                 # 推进一 tick，返回观测；内核叫�
     robot.set("a1", 0.5)            # 按名字写控制量
     obs = robot.obs                 # {"tick","qpos","qvel","bodies","objects",...}
     cube = obs["objects"]["cube"]    # 场景物体全局可见
+    touch = robot.sensor("fl_touch")           # 传感器读数（世界 YAML 里声明过）
+    imu = robot.sensor("wrist_imu")            # 6 维 IMU 返回 [gx,gy,gz,ax,ay,az]
     snap = robot.supervise("save", tag="mid")   # 快照/读档/teleport
 ```
 
@@ -191,7 +209,8 @@ while robot.step():                 # 推进一 tick，返回观测；内核叫�
 
 ```bash
 python -m pytest tests/ -q
-# 71 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/MCP/场景生成
+# 122 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+#              MCP（含 screenshot）/传感器（含 bit 级轨迹守护）/场景生成/GUI
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。
@@ -207,21 +226,23 @@ agentsim/
 │   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译
 │   ├── supervisor.py      # 快照/teleport（逐位可复现）
 │   ├── mcp_server.py      # MCP stdio 服务器（零依赖 JSON-RPC）
+│   ├── render.py          # 离屏渲染 + 手写 PNG 编码（screenshot 实现层）
 │   ├── gui/               # PySide6 桌面 GUI（app / render_view / panels / mcp_client）
 │   ├── scene_gen.py       # 5 个确定性场景模板
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 87 项测试
+└── tests/                 # 122 项测试
 ```
 
 ## Roadmap
 
-- [x] M0 仿真内核（物理 / 进程隔离 / Supervisor / MCP / 场景生成，71 项测试）
+- [x] M0 仿真内核（物理 / 进程隔离 / Supervisor / MCP / 场景生成）
 - [x] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染；run 后台线程化，30Hz 观测快照（`python -m agentsim gui`）
+- [x] M2 传感器系统 + MCP screenshot —— 五类传感器（encoder / IMU / 触觉 / 关节力矩 / 相机）YAML 声明进观测流，bit 级守护保证不改变物理轨迹；`screenshot` 工具让 Agent 截取仿真画面（自由机位或声明的相机机位）
 - [ ] M1 心跳机制（内核崩溃时控制器可感知退出）
-- [ ] 更多机器人模型与传感器（关节力矩、触觉、相机）
+- [ ] 更多机器人模型（灵巧手、移动操作平台）
 - [ ] RL 训练接口（gym.Env 封装）
 
 ## 已知取舍（M0）

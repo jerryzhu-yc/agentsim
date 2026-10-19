@@ -15,11 +15,17 @@
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import pathlib
 import sys
 import threading
 import time
+
+# 离屏渲染后端默认 EGL（无头/远程友好；默认 GLX 需要真窗口系统）。
+# 必须在 import mujoco 之前设置；用户可用环境变量覆盖（与 gui/__init__.py 同款）。
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import yaml
@@ -27,10 +33,18 @@ import yaml
 from agentsim import supervisor
 from agentsim.errors import WorldError
 from agentsim.kernel.sim import Simulation
+from agentsim.render import encode_png, render_offscreen
 from agentsim.world.schema import load_world as _load_world_file
 from agentsim.world.schema import parse_world
 
 _PROTOCOL = "2024-11-05"
+
+# 工具结果直传 MCP content（image 等非文本块）：dispatch 识别此类型并透传，
+# 其余结果仍按惯例 JSON 化后包成 text content。
+class _RawContent(dict):
+    def __init__(self, content: list):
+        super().__init__(content=content, isError=False)
+
 
 # run 的响应被推迟（后台线程跑完才写回）时 dispatch 返回此哨兵，
 # serve 主循环见到它不写 stdout（响应由 run 线程经 Writer 写）。
@@ -86,13 +100,36 @@ _TOOLS = [
     {
         "name": "get_observation",
         "description": "当前完整观察量：各机器人 qpos/qvel/ctrl/body 位置 + "
-                       "场景物体位置 + 任务状态（success/reward）。",
+                       "场景物体位置 + 任务状态（success/reward）。"
+                       "带传感器的机器人另含 sensors 读数。",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "screenshot",
+        "description": "把当前仿真状态渲染成 PNG 截图。缺省自由机位（与 GUI 默认"
+                       "视角一致）；传 camera 用声明过的相机视角（名字见 "
+                       "get_robot_manifest 的 cameras）。缺省返回 image content"
+                       "（base64 PNG）；传 path 则写盘并返回文件信息。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "width": {"type": "integer", "minimum": 16, "maximum": 1920,
+                           "description": "像宽，缺省 800"},
+                "height": {"type": "integer", "minimum": 16, "maximum": 1920,
+                            "description": "像高，缺省 600"},
+                "camera": {"type": "string",
+                            "description": "相机名（manifest 里的名字）；缺省自由机位"},
+                "path": {"type": "string",
+                          "description": "PNG 写盘路径；缺省内联 image content"},
+            },
+        },
     },
     {
         "name": "get_robot_manifest",
         "description": "机器人设备清单：执行器名字与控制范围、关节类型与限位、"
-                       "body 名（带前缀的全名与短名都在）。写控制器前先看这个。",
+                       "body 名（带前缀的全名与短名都在）、传感器清单"
+                       "（名字/类型/维度）与相机名（screenshot 的 camera 参数用）。"
+                       "写控制器前先看这个。",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -137,6 +174,10 @@ class AgentSimSession:
         self.spec = None
         self.sim: Simulation | None = None
         self.yaml_text: str | None = None
+        # screenshot 渲染器按 (w, h) 缓存；Renderer 绑定 model，
+        # load_world/reset 经 close() 一并销毁重建
+        self._renderer: "mujoco.Renderer | None" = None
+        self._renderer_wh: tuple[int, int] | None = None
         # run 后台线程化（GUI 实时观测的基础）
         self._run_thread: threading.Thread | None = None
         self._snap = None                 # run 期间最新观测快照（run 线程写）
@@ -164,6 +205,9 @@ class AgentSimSession:
         # run 还在跑（如 realtime 世界）：给它一点时间收尾，等不及就随进程退出
         if self.is_running and threading.current_thread() is not self._run_thread:
             self._run_thread.join(timeout=5)
+        if self._renderer is not None:   # Renderer 绑定的 model 随 sim 一起失效
+            self._renderer.close()
+            self._renderer, self._renderer_wh = None, None
         if self.sim is not None:
             self.sim.close()
             self.sim = None
@@ -338,6 +382,9 @@ class AgentSimSession:
                 "actuators": actuators,
                 "joints": joints,
                 "bodies": {f"{rd.name}/{short}": short for short in ridx.bodies},
+                "sensors": [{"name": six.name, "type": six.kind, "dim": six.dim}
+                            for six in ridx.sensors.values()],
+                "cameras": list(ridx.cameras),
             })
         return {
             "world": self.spec.name,
@@ -380,6 +427,56 @@ class AgentSimSession:
         if self.yaml_text is None:
             raise WorldError("还没有加载世界（先 load_world）")
         return self.yaml_text
+
+    def _tool_screenshot(self, args: dict):
+        """渲染当前状态为 PNG：内联 image content 或写盘。"""
+        self._require_idle()
+        sim = self._require_sim()
+        w = int(args.get("width") or 800)
+        h = int(args.get("height") or 600)
+        if not (16 <= w <= 1920 and 16 <= h <= 1920):
+            raise WorldError(f"width/height 需在 16..1920 内，实际: {w}x{h}")
+        camera = args.get("camera")
+        if camera is not None:
+            camera = self._resolve_camera(sim, str(camera))
+        rend = self._renderer
+        if rend is None or self._renderer_wh != (w, h):
+            if rend is not None:
+                rend.close()
+            rend = mujoco.Renderer(sim.model, h, w)
+            self._renderer, self._renderer_wh = rend, (w, h)
+        rgb = render_offscreen(sim.model, sim.data, w, h, camera, renderer=rend)
+        png = encode_png(rgb)
+        path = args.get("path")
+        if path:
+            path = pathlib.Path(path).expanduser()
+            path.write_bytes(png)
+            return {"path": str(path), "width": w, "height": h, "bytes": len(png)}
+        return _RawContent([{
+            "type": "image",
+            "data": base64.b64encode(png).decode("ascii"),
+            "mimeType": "image/png",
+        }])
+
+    def _resolve_camera(self, sim: Simulation, name: str) -> str:
+        """相机名解析：manifest 短名 -> 带机器人前缀全名；模型自带相机名直接用。"""
+        m = sim.model
+        shortnames, allnames = set(), set()
+        for rname, ridx in sim.index.robots.items():
+            for short in ridx.cameras:
+                shortnames.add(short)
+                allnames.add(short)
+                allnames.add(f"{rname}/{short}")
+        for cid in range(m.ncam):
+            long = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_CAMERA, cid)
+            allnames.add(long)
+        if name in shortnames:                      # 短名补前缀
+            for rname, ridx in sim.index.robots.items():
+                if name in ridx.cameras:
+                    return f"{rname}/{name}"
+        if mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, name) >= 0:
+            return name                             # 全名或模型自带名
+        raise WorldError(f"相机 '{name}' 不存在，可用: {sorted(allnames)}")
 
     # ------------------------------------------------------------ 辅助
 
@@ -453,6 +550,8 @@ def dispatch(session: AgentSimSession, method: str, params: dict, req_id,
             return _rpc_result(req_id, {
                 "content": [{"type": "text", "text": str(e)}],
                 "isError": True})
+        if isinstance(result, _RawContent):      # screenshot：image content 透传
+            return _rpc_result(req_id, dict(result))
         text = result if isinstance(result, str) else json.dumps(
             result, ensure_ascii=False)
         return _rpc_result(req_id, {

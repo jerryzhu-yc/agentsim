@@ -6,13 +6,34 @@
 2. 协议层（真实子进程）：stdio JSON-RPC 的 initialize / tools/list /
    tools/call 线协议
 """
+import base64
 import json
 import pathlib
+import struct
 import subprocess
 import sys
+import threading
 
-from agentsim.mcp_server import AgentSimSession
+import pytest
 
+from agentsim.errors import WorldError
+from agentsim.mcp_server import AgentSimSession   # 导入即 setdefault MUJOCO_GL=egl
+
+
+def _have_offscreen_glx() -> bool:
+    """离屏渲染可用性探测（EGL 由 mcp_server 导入时默认）。"""
+    try:
+        import mujoco
+        m = mujoco.MjModel.from_xml_string("<mujoco/>")
+        r = mujoco.Renderer(m, 32, 32)
+        r.render()
+        r.close()
+        return True
+    except Exception:
+        return False
+
+
+_OSSCREEN = _have_offscreen_glx()
 ROOT = pathlib.Path(__file__).parent.parent
 WORLD = ROOT / "worlds" / "pick_cube.yaml"
 
@@ -266,7 +287,8 @@ class TestStdioProtocol:
             r = rpc("tools/list")
             names = {t["name"] for t in r["result"]["tools"]}
             assert {"load_world", "run", "get_observation", "get_robot_manifest",
-                    "save_state", "load_state", "reset", "read_world"} <= names
+                    "save_state", "load_state", "reset", "read_world",
+                    "screenshot"} <= names
 
             r = rpc("tools/call", {"name": "load_world",
                                    "arguments": {"yaml_path": str(WORLD)}})
@@ -283,3 +305,162 @@ class TestStdioProtocol:
         finally:
             proc.stdin.close()
             proc.wait(timeout=15)
+
+    @pytest.mark.skipif(not _OSSCREEN, reason="本环境无离屏渲染（EGL）")
+    def test_stdio_screenshot_image_content(self):
+        """stdio 线协议层：screenshot 的 image content 原样透传给 Agent。"""
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "agentsim", "mcp"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1, cwd=str(ROOT))
+
+        def rpc(method, params=None, req_id=1):
+            proc.stdin.write(json.dumps(
+                {"jsonrpc": "2.0", "id": req_id, "method": method,
+                 "params": params if params is not None else {}}) + "\n")
+            return json.loads(proc.stdout.readline())
+
+        try:
+            rpc("initialize", {"protocolVersion": "2024-11-05"})
+            r = rpc("tools/call", {"name": "load_world",
+                                   "arguments": {"yaml_path": str(WORLD)}})
+            assert r["result"]["isError"] is False
+            r = rpc("tools/call", {"name": "screenshot",
+                                   "arguments": {"width": 32, "height": 32}})
+            assert r["result"]["isError"] is False
+            block = r["result"]["content"][0]
+            assert block["type"] == "image"
+            assert block["mimeType"] == "image/png"
+            assert _png_size(base64.b64decode(block["data"])) == (32, 32)
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=15)
+
+
+# ---------------------------------------------------------------- screenshot（T9-T13）
+
+def _world_with_sensors():
+    """pick_cube + arm 传感器全套（含相机），Agent 改 YAML 的同一注入路径。"""
+    text = WORLD.read_text(encoding="utf-8")
+    anchor = "    controller: ../controllers/pick_place.py   # 侧扫推式相位机"
+    sensors = (
+        "\n    sensors:\n"
+        "      - {name: j1_enc, type: encoder, joint: j1}\n"
+        "      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}\n"
+        "      - {name: fl_touch, type: tactile, body: finger_l, pos: [0, 0, 0]}\n"
+        "      - {name: gripper_cam, type: camera, body: wrist,"
+        " pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}")
+    return text.replace(anchor, anchor + sensors)
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    """从 PNG bytes 里解 IHDR 的宽高。"""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert data[12:16] == b"IHDR"
+    return struct.unpack(">II", data[16:24])
+
+
+@pytest.mark.skipif(not _OSSCREEN, reason="本环境无离屏渲染（EGL）")
+class TestScreenshot:
+    def _session(self):
+        s = AgentSimSession()
+        s.call_tool("load_world", {"yaml_text": _world_with_sensors(),
+                                   "base_dir": str(ROOT / "worlds")})
+        return s
+
+    def test_inline_image_content(self):
+        """无 path：返回 image content，base64 解码后是 PNG 且尺寸正确（T9）。"""
+        s = self._session()
+        try:
+            r = s.call_tool("screenshot", {"width": 64, "height": 48})
+            assert r["isError"] is False
+            block = r["content"][0]
+            assert block["type"] == "image"
+            assert block["mimeType"] == "image/png"
+            png = base64.b64decode(block["data"])
+            assert _png_size(png) == (64, 48)
+        finally:
+            s.close()
+
+    def test_camera_view_differs_from_free(self):
+        """相机机位（manifest 短名）与自由机位截图不同（T10）。"""
+        s = self._session()
+        try:
+            free = s.call_tool("screenshot", {"width": 96, "height": 72})
+            cam = s.call_tool("screenshot", {"width": 96, "height": 72,
+                                             "camera": "gripper_cam"})
+            assert free["content"][0]["data"] != cam["content"][0]["data"]
+            # 不存在的相机：报错并给出可用名
+            with pytest.raises(WorldError, match="可用"):
+                s.call_tool("screenshot", {"camera": "no_such_cam"})
+        finally:
+            s.close()
+
+    def test_path_mode_writes_png_file(self, tmp_path):
+        """path 模式写盘并可解 PNG 头（T11）。"""
+        p = tmp_path / "shot.png"
+        s = self._session()
+        try:
+            r = s.call_tool("screenshot", {"width": 32, "height": 24,
+                                           "path": str(p)})
+            assert r["path"] == str(p)
+            assert r["width"] == 32 and r["height"] == 24
+            assert r["bytes"] > 0
+            assert _png_size(p.read_bytes()) == (32, 24)
+        finally:
+            s.close()
+
+    def test_rejected_while_run_in_progress(self):
+        """run 进行中调用 screenshot 必须 isError（快照与渲染有竞态，T12）。
+
+        _require_idle 只看 _run_thread 存活状态——注入一个活跃线程与真实
+        run 等价，免去真实 run 的启动窗口竞态（轮询 is_running 也可能错过）。
+        """
+        s = AgentSimSession()
+        try:
+            s.call_tool("load_world", {"yaml_path": str(WORLD)})
+            stop = threading.Event()
+
+            def hold():                 # 挂住直到测试放行，保证线程全程存活
+                stop.wait(timeout=30)
+
+            s._run_thread = threading.Thread(target=hold, daemon=True)
+            s._run_thread.start()
+            with pytest.raises(WorldError, match="run 正在进行中"):
+                s.call_tool("screenshot", {})
+            stop.set()
+            s._run_thread.join(timeout=5)
+        finally:
+            s.close()
+
+    def test_manifest_lists_sensors_and_cameras(self):
+        """manifest 含传感器（名/类型/维度）与相机名（T13）。"""
+        s = self._session()
+        try:
+            m = s.call_tool("get_robot_manifest", {})
+            arm = m["robots"][0]
+            dims = {x["name"]: x["dim"] for x in arm["sensors"]}
+            types = {x["name"]: x["type"] for x in arm["sensors"]}
+            assert dims["j1_enc"] == 1 and types["j1_enc"] == "encoder"
+            assert dims["wrist_imu"] == 6 and types["wrist_imu"] == "imu"
+            assert types["fl_touch"] == "tactile"
+            assert arm["cameras"] == ["gripper_cam"]
+        finally:
+            s.close()
+
+    def test_renderer_cache_and_world_reload(self):
+        """同尺寸复用缓存 Renderer；load_world 换世界后旧 Renderer 失效可重截。"""
+        s = self._session()
+        try:
+            s.call_tool("screenshot", {"width": 40, "height": 30})
+            rend = s._renderer
+            s.call_tool("screenshot", {"width": 40, "height": 30})
+            assert s._renderer is rend            # 尺寸不变不重建
+            s.call_tool("screenshot", {"width": 50, "height": 30})
+            assert s._renderer is not rend         # 尺寸变则重建
+            s.call_tool("load_world", {"yaml_path": str(WORLD)})
+            assert s._renderer is None             # 换世界销毁
+            r = s.call_tool("screenshot", {"width": 40, "height": 30})
+            assert r["content"][0]["type"] == "image"
+        finally:
+            s.close()

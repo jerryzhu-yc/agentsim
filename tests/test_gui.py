@@ -146,6 +146,43 @@ def test_gui_modules_importable():
         importlib.import_module(mod)
 
 
+@pytest.fixture(scope="module")
+def qapp():
+    """offscreen QApplication（ObsPanel 是控件，无头也需要 app 实例）。"""
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_obs_panel_shows_sensors(qapp):
+    """ObsPanel 收带 sensors 的 obs 后树含传感器节点（T15）。"""
+    from agentsim.gui.panels import ObsPanel
+    p = ObsPanel()
+    try:
+        p.update_obs({"robots": {"arm": {
+            "joint_names": ["j1"], "qpos": [0.0], "ctrl": [0.0],
+            "sensors": {"j1_enc": 0.25,
+                        "wrist_imu": [0.0, 0.0, 0.0, 0.0, 0.0, 9.81],
+                        "fl_touch": 0.0}}}})
+        top = p._tree.topLevelItem(0)
+        kids = {top.child(i).text(0): top.child(i)
+                for i in range(top.childCount())}
+        assert "sensors" in kids
+        st = kids["sensors"]
+        nodes = {st.child(i).text(0): st.child(i)
+                  for i in range(st.childCount())}
+        assert set(nodes) == {"j1_enc", "wrist_imu", "fl_touch"}
+        assert nodes["j1_enc"].text(1) == "+0.250"        # 标量
+        assert "+9.810" in nodes["wrist_imu"].text(1)     # 6 维拼接展示
+        # 未声明传感器的机器人不建 sensors 节点（向后兼容）
+        p.update_obs({"robots": {"arm": {"joint_names": ["j1"],
+                                         "qpos": [0.0], "ctrl": [0.0]}}})
+        kids = {p._tree.topLevelItem(0).child(i).text(0)
+                for i in range(p._tree.topLevelItem(0).childCount())}
+        assert "sensors" not in kids
+    finally:
+        p.deleteLater()
+
+
 def test_cli_gui_help():
     """cli gui 子命令存在（不真启动 GUI）。"""
     import subprocess

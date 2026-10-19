@@ -46,6 +46,8 @@ class Robot:
         self.args: dict = init["args"]
         self.ctrl_period: int = init["ctrl_period"]
         self.timestep: float = init["timestep"]
+        # 传感器设备清单 [{name,type,dim}]（hello 握手下发；无传感器为 []）
+        self.sensors: list[dict] = init.get("sensors", [])
         self._ctrl = [0.0] * len(self.actuators)
 
         self.obs: dict = {}
@@ -90,6 +92,20 @@ class Robot:
     def joint_state(self) -> dict:
         """便捷读取：{关节名: 位置}（从最近一次观测取）"""
         return dict(zip(self.joint_names, self.obs.get("qpos", [])))
+
+    def sensor(self, name: str) -> float | list[float]:
+        """读传感器最近读数（dim=1 标量；imu 等多维返回列表），从最近一次观测取。
+
+        相机没有读数（只是 viewpoint 声明，截图走 MCP screenshot 工具）。
+        """
+        vals = (self.obs.get("sensors") or {}).get(name)
+        if vals is None:
+            declared = [s["name"] for s in self.sensors]
+            if name in declared:
+                raise RuntimeError(f"传感器 '{name}' 的读数还没到——先 step() 一次")
+            raise KeyError(f"机器人 '{self.name}' 没有传感器 '{name}'，"
+                           f"可用: {declared}")
+        return vals
 
     def supervise(self, action: str, **params) -> dict:
         """Supervisor 操作：save/load/teleport/reset。

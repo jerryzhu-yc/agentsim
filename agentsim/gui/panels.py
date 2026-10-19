@@ -64,7 +64,7 @@ class TaskPanel(QGroupBox):
 
 
 class ObsPanel(QGroupBox):
-    """观测树：逐机器人关节 qpos/ctrl + 物体 pos/quat。"""
+    """观测树：逐机器人关节 qpos/ctrl + 传感器读数 + 物体 pos/quat。"""
 
     def __init__(self, parent=None):
         super().__init__("观测", parent)
@@ -86,6 +86,15 @@ class ObsPanel(QGroupBox):
                 if i < len(ctrl):
                     v += f" u={ctrl[i]:+.3f}"
                 QTreeWidgetItem(top, [jn, v])
+            sensors = robs.get("sensors") or {}
+            if sensors:                        # M2：有传感器才有该键
+                st = QTreeWidgetItem(top, ["sensors"])
+                for sn, sv in sensors.items():
+                    if isinstance(sv, list):
+                        sv = "(" + ", ".join(f"{x:+.3f}" for x in sv) + ")"
+                    else:
+                        sv = f"{sv:+.3f}"
+                    QTreeWidgetItem(st, [sn, sv])
             self._tree.addTopLevelItem(top)
         for oname, oinfo in (obs.get("objects") or {}).items():
             pos = oinfo.get("pos") or []

@@ -19,6 +19,10 @@ from agentsim.errors import WorldError
 _GEOM_ARITY = {"box": 3, "sphere": 1, "cylinder": 2}
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _TIMEOUT_POLICIES = {"last_ctrl", "pause"}
+# 传感器类型 -> 挂点要求：joint 系只引用关节，body 系只引用 body
+_SENSOR_TYPES = {"encoder", "imu", "tactile", "joint_torque", "camera"}
+_JOINT_SENSORS = {"encoder", "joint_torque"}
+_BODY_SENSORS = {"imu", "tactile", "camera"}
 
 
 # ---------------------------------------------------------------- dataclass 定义
@@ -49,12 +53,38 @@ class ObjectSpec:
 
 
 @dataclass
+class SensorSpec:
+    """机器人传感器声明（编译进 MuJoCo，观测流带读数）。
+
+    类型 -> 挂点要求：
+    - encoder / joint_torque：引用 joint（读数 = 关节位置 / 关节约束力）
+    - imu / tactile：引用 body（builder 自动在 body 上建挂点 site；
+      imu = 陀螺 3 + 加速度计 3 共 6 维；tactile 用 mjSENS_TOUCH 标量接触力，
+      不是 MuJoCo 的 mjSENS_TACTILE 网格阵列）
+    - camera：引用 body（仅声明 mj 相机 viewpoint，供 screenshot 按名渲染；
+      不进 obs 数值流——每 tick 渲染图像太重）
+
+    tactile 的 radius：MuJoCo 3.x 的 touch 只统计接触点落在以挂点 site 为球心、
+    site size 为半径的球内的接触力（site size 默认 0 → 恒 0 的坑由此而来）。
+    radius 应覆盖挂点 body 的预期接触区，默认 0.06（罩住典型指尖/指板整面）。
+    """
+    name: str
+    type: str                       # encoder | imu | tactile | joint_torque | camera
+    joint: str | None = None        # encoder/joint_torque 必填
+    body: str | None = None          # imu/tactile/camera 必填
+    pos: tuple[float, float, float] = (0.0, 0.0, 0.0)   # body 局部系挂点偏移
+    quat: tuple[float, float, float, float] | None = None  # 仅 camera
+    radius: float | None = None     # 仅 tactile：touch 接触过滤球半径(米)
+
+
+@dataclass
 class RobotSpec:
     name: str
     model: str                      # MJCF 路径（相对世界文件）
     pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     controller: str | None = None   # 控制器脚本路径（相对世界文件）
     args: dict = field(default_factory=dict)
+    sensors: list[SensorSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -217,6 +247,57 @@ def _parse_scene(d, path: str) -> SceneSpec:
     return SceneSpec(floor=floor, lights=lights, objects=objects)
 
 
+def _parse_sensors(rd: dict, p: str) -> list[SensorSpec]:
+    """robot 段下的 sensors 列表。joint/body 是否真实存在由 builder 核对。"""
+    sensors = []
+    seen_names: dict[str, str] = {}
+    for i, sd in enumerate(rd.get("sensors", [])):
+        sp = f"{p}.sensors[{i}]"
+        if not isinstance(sd, dict):
+            raise _err(sp, f"需要字典，实际是: {sd!r}")
+        name = _str(_req(sd, "name", sp), f"{sp}.name")
+        if "/" in name:
+            raise _err(f"{sp}.name", f"名字里不能含 '/'（会与机器人前缀冲突）: {name!r}")
+        if name in seen_names:
+            raise _err(f"{sp}.name", f"名字 '{name}' 重复（已用于 {seen_names[name]}）")
+        seen_names[name] = sp
+        stype = _str(_req(sd, "type", sp), f"{sp}.type")
+        if stype not in _SENSOR_TYPES:
+            raise _err(f"{sp}.type", f"未知传感器类型 '{stype}'，支持: {sorted(_SENSOR_TYPES)}")
+        joint = sd.get("joint")
+        body = sd.get("body")
+        if stype in _JOINT_SENSORS:
+            if joint is None:
+                raise _err(sp, f"类型 '{stype}' 需要 joint 字段")
+            if body is not None:
+                raise _err(f"{sp}.body", f"类型 '{stype}' 不使用 body（挂点是 joint）")
+            joint = _str(joint, f"{sp}.joint")
+        else:
+            if body is None:
+                raise _err(sp, f"类型 '{stype}' 需要 body 字段")
+            if joint is not None:
+                raise _err(f"{sp}.joint", f"类型 '{stype}' 不使用 joint（挂点是 body）")
+            body = _str(body, f"{sp}.body")
+        pos = _vec(sd.get("pos", [0, 0, 0]), 3, f"{sp}.pos")
+        quat = None
+        if "quat" in sd:
+            quat = _vec(sd["quat"], 4, f"{sp}.quat")
+            if stype != "camera":
+                raise _err(f"{sp}.quat", f"只有 camera 用 quat，类型 '{stype}' 请删掉")
+        radius = None
+        if "radius" in sd:
+            if stype != "tactile":
+                raise _err(f"{sp}.radius", f"只有 tactile 用 radius，类型 '{stype}' 请删掉")
+            radius = _num(sd["radius"], f"{sp}.radius")
+            if radius <= 0:
+                raise _err(f"{sp}.radius", f"必须为正数(米)，实际是: {radius}")
+        if stype == "tactile" and radius is None:
+            radius = 0.06
+        sensors.append(SensorSpec(name=name, type=stype, joint=joint, body=body,
+                                  pos=pos, quat=quat, radius=radius))
+    return sensors
+
+
 def _parse_robots(d, path: str, seen: dict) -> list[RobotSpec]:
     robots = []
     for i, rd in enumerate(d.get("robots", [])):
@@ -231,8 +312,9 @@ def _parse_robots(d, path: str, seen: dict) -> list[RobotSpec]:
         args = rd.get("args", {})
         if not isinstance(args, dict):
             raise _err(f"{p}.args", f"需要字典，实际是: {args!r}")
+        sensors = _parse_sensors(rd, p)
         robots.append(RobotSpec(name=name, model=model, pos=pos,
-                                controller=controller, args=args))
+                                controller=controller, args=args, sensors=sensors))
     return robots
 
 

@@ -19,8 +19,8 @@ import mujoco
 
 from agentsim.errors import WorldError
 from agentsim.world.schema import (
-    WorldSpec, RobotSpec, TaskSpec, DistanceReward, ZoneReward, ContactReward,
-    hex_to_rgba,
+    WorldSpec, RobotSpec, SensorSpec, TaskSpec, DistanceReward, ZoneReward,
+    ContactReward, hex_to_rgba,
 )
 
 _GEOM_TYPE_MAP = {
@@ -33,12 +33,29 @@ _GEOM_TYPE_MAP = {
 # ---------------------------------------------------------------- 名字索引
 
 @dataclass
+class SensorIndex:
+    """单个传感器的读数定位：obs 按顺序拼接 parts 得到该传感器全量读数。
+
+    encoder/joint_torque/tactile 为单 part；imu 为 [gyro(3), accel(3)] 两个 part。
+    """
+    name: str
+    kind: str                       # YAML 类型
+    parts: list[tuple[int, int]] = field(default_factory=list)  # (sensor_adr, dim)
+
+    @property
+    def dim(self) -> int:
+        return sum(d for _, d in self.parts)
+
+
+@dataclass
 class RobotIndex:
     """单个机器人的设备索引（名字均为无前缀原始名）"""
     name: str
     actuators: dict[str, int] = field(default_factory=dict)   # 执行器名 -> id
     joints: dict[str, int] = field(default_factory=dict)     # 关节名 -> id
     bodies: dict[str, int] = field(default_factory=dict)     # body 名 -> id
+    sensors: dict[str, SensorIndex] = field(default_factory=dict)  # YAML 传感器名 -> 索引
+    cameras: dict[str, int] = field(default_factory=dict)     # 相机名 -> camera id
 
 
 @dataclass
@@ -140,6 +157,76 @@ def _build_scene(spec: WorldSpec, mj: mujoco.MjSpec):
         body.add_geom(**kwargs)
 
 
+def _add_child_sensors(robot: RobotSpec, child: mujoco.MjSpec) -> None:
+    """attach 前往 child spec 注入传感器/site/相机（前缀随后自动生效）。
+
+    命名约定（attach 后的全名 = "<robot>/<名字>"）：
+    - encoder/joint_torque/tactile：MuJoCo 传感器名 = YAML 传感器名
+    - imu：拆成 "<名>_gyro"(3) + "<名>_accel"(3)，obs 拼成 6 维
+    - imu/tactile 的挂点 site："<名>_site"
+    - camera：相机名 = YAML 传感器名（不加 MuJoCo sensor）
+    """
+    if not robot.sensors:
+        return
+    joint_names = {j.name for j in child.joints}
+    body_names = {b.name for b in child.bodies}
+    site_names = {s.name for s in child.sites}
+    sensor_names = {s.name for s in child.sensors}
+    camera_names = {c.name for c in child.cameras}
+
+    def _find_body(s: SensorSpec):
+        if s.body not in body_names:
+            raise WorldError(
+                f"机器人 '{robot.name}' 的传感器 '{s.name}' 引用的 body "
+                f"'{s.body}' 不在模型里，可用: {sorted(body_names)}")
+        return child.body(s.body)
+
+    for s in robot.sensors:
+        if s.name in sensor_names or s.name in camera_names:
+            raise WorldError(
+                f"机器人 '{robot.name}' 的传感器 '{s.name}' 与模型里既有"
+                f" sensor/camera 名冲突")
+        if s.type in ("encoder", "joint_torque"):
+            if s.joint not in joint_names:
+                raise WorldError(
+                    f"机器人 '{robot.name}' 的传感器 '{s.name}' 引用的关节 "
+                    f"'{s.joint}' 不在模型里，可用: {sorted(joint_names)}")
+            stype = (mujoco.mjtSensor.mjSENS_JOINTPOS if s.type == "encoder"
+                     else mujoco.mjtSensor.mjSENS_JOINTACTFRC)
+            child.add_sensor(name=s.name, type=stype,
+                             objtype=mujoco.mjtObj.mjOBJ_JOINT, objname=s.joint)
+        elif s.type == "imu":
+            site_name = f"{s.name}_site"
+            if site_name in site_names:
+                raise WorldError(
+                    f"机器人 '{robot.name}' 的挂点 site '{site_name}' 与模型里"
+                    f"既有 site 名冲突")
+            _find_body(s).add_site(name=site_name, pos=list(s.pos))
+            child.add_sensor(name=f"{s.name}_gyro",
+                             type=mujoco.mjtSensor.mjSENS_GYRO,
+                             objtype=mujoco.mjtObj.mjOBJ_SITE, objname=site_name)
+            child.add_sensor(name=f"{s.name}_accel",
+                             type=mujoco.mjtSensor.mjSENS_ACCELEROMETER,
+                             objtype=mujoco.mjtObj.mjOBJ_SITE, objname=site_name)
+        elif s.type == "tactile":
+            site_name = f"{s.name}_site"
+            if site_name in site_names:
+                raise WorldError(
+                    f"机器人 '{robot.name}' 的挂点 site '{site_name}' 与模型里"
+                    f"既有 site 名冲突")
+            # size 即 touch 的接触过滤球半径：MuJoCo 3.x 只统计接触点落在
+            # 以 site 为球心、size 为半径的球内的接触力（size=0 → 恒 0）
+            _find_body(s).add_site(name=site_name, pos=list(s.pos),
+                                   size=[s.radius] * 3)
+            child.add_sensor(name=s.name, type=mujoco.mjtSensor.mjSENS_TOUCH,
+                             objtype=mujoco.mjtObj.mjOBJ_SITE, objname=site_name)
+        elif s.type == "camera":
+            kwargs = dict(name=s.name, pos=list(s.pos))
+            if s.quat is not None:
+                kwargs["quat"] = list(s.quat)
+            _find_body(s).add_camera(**kwargs)
+
+
 def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
     model_path = _resolve_path(spec.base_dir, robot.model, "机器人模型")
     try:
@@ -147,6 +234,7 @@ def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
     except Exception as e:
         raise WorldError(f"机器人 '{robot.name}' 模型解析失败 ({model_path}): {e}") from e
 
+    _add_child_sensors(robot, child)
     frame = mj.worldbody.add_frame(name=f"{robot.name}_frame", pos=list(robot.pos))
     try:
         mj.attach(child, prefix=f"{robot.name}/", frame=frame)
@@ -182,6 +270,28 @@ def _build_index(model: mujoco.MjModel, spec: WorldSpec) -> NameIndex:
                     f"编译后找不到机器人 '{rd.name}' 的关节 '{jnt_name}'"
                     f"（期望全名 '{prefix}{jnt_name}'）")
             ridx.joints[jnt_name] = jid
+        # 传感器（imu 拆成 gyro/accel 两个 MuJoCo sensor，按 part 记录读数区间）
+        for s in rd.sensors:
+            if s.type == "camera":
+                cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                         f"{prefix}{s.name}")
+                if cid < 0:
+                    raise WorldError(
+                        f"编译后找不到机器人 '{rd.name}' 的相机 '{s.name}'"
+                        f"（期望全名 '{prefix}{s.name}'）")
+                ridx.cameras[s.name] = cid
+                continue
+            mj_names = ([f"{prefix}{s.name}"] if s.type != "imu"
+                        else [f"{prefix}{s.name}_gyro", f"{prefix}{s.name}_accel"])
+            parts = []
+            for full in mj_names:
+                sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, full)
+                if sid < 0:
+                    raise WorldError(
+                        f"编译后找不到机器人 '{rd.name}' 的传感器 '{full}'"
+                        f"（编译器吞了名字？）")
+                parts.append((int(model.sensor_adr[sid]), int(model.sensor_dim[sid])))
+            ridx.sensors[s.name] = SensorIndex(name=s.name, kind=s.type, parts=parts)
         index.robots[rd.name] = ridx
     # 全部 body（含前缀）
     for i in range(model.nbody):

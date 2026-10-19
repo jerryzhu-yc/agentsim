@@ -167,12 +167,15 @@ class Simulation:
         ridx = self.index.robots[rname]
         ranges = [list(map(float, self.model.actuator_ctrlrange[ridx.actuators[a]]))
                   for a in ridx.actuators]
+        sensors_manifest = [{"name": six.name, "type": six.kind, "dim": six.dim}
+                            for six in ridx.sensors.values()]
         self._ident[ident] = rname
         self._send(ident, {
             "op": "init", "robot": rname,
             "actuators": list(ridx.actuators), "ranges": ranges,
             "args": rd.args, "ctrl_period": self.spec.ctrl_period,
             "timestep": self.spec.timestep,
+            "sensors": sensors_manifest,
         })
         self._st[rname]["active"] = True
 
@@ -250,13 +253,23 @@ class Simulation:
         # 场景物体全局可见（控制闭环需要：抓取要看着 cube 的位置）
         objects = {name: [float(x) for x in self.data.xpos[bid]]
                    for name, bid in self.index.objects.items()}
-        return {
+        msg = {
             "op": "obs", "tick": self.tick, "time": float(self.data.time),
             "ctrl": list(map(float, self.data.ctrl[
                 list(ridx.actuators.values())])),
             "joint_names": list(ridx.joints), "qpos": qpos, "qvel": qvel,
             "bodies": bodies, "objects": objects,
         }
+        # 传感器读数（声明过的机器人才有这个键；sensordata 在 mj_step 末尾已就绪）
+        if ridx.sensors:
+            sensors = {}
+            for sname, six in ridx.sensors.items():
+                vals = []
+                for adr, dim in six.parts:
+                    vals += list(map(float, self.data.sensordata[adr:adr + dim]))
+                sensors[sname] = vals[0] if six.dim == 1 else vals
+            msg["sensors"] = sensors
+        return msg
 
     def _check_crashes(self) -> None:
         for name, proc in self._procs.items():
