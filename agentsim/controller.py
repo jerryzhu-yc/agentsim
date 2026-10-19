@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import zmq
 
@@ -29,6 +30,10 @@ class Robot:
     def __init__(self):
         ns = self._parse_args()
         self.name = ns.robot
+        # 心跳：记录父进程（内核）pid。内核是控制器的直接父进程
+        # （Simulation spawn），内核一死控制器就被 init/subreaper 收养，
+        # getppid 必变——这是崩溃可感知的信号
+        self._parent_pid = os.getppid()
         self._ctx = zmq.Context()
         self._sock = self._ctx.socket(zmq.REQ)
         self._sock.setsockopt(zmq.LINGER, 0)
@@ -140,7 +145,27 @@ class Robot:
 
     def _rpc(self, msg: dict) -> dict:
         self._sock.send(json.dumps(msg).encode())
-        return json.loads(self._sock.recv())
+        return self._recv()
+
+    def _recv(self) -> dict:
+        """等回复：100ms poller 轮询 + 父进程孤儿检测（心跳）。
+
+        等待在语义上仍然无限（Webots：等世界，Agent 思考多久都行）——
+        唯一的退出条件是内核进程死亡：父 pid 变化 = 被 init/subreaper
+        收养，此时 RuntimeError 提示用户脚本结束（不捕获则进程非零退出）。
+        内核正常收尾走 stop/bye_ack 回复路径，不经孤儿检测。
+        """
+        poller = zmq.Poller()
+        poller.register(self._sock, zmq.POLLIN)
+        try:
+            while True:
+                if poller.poll(100):          # 有消息立即返回（微秒级）
+                    return json.loads(self._sock.recv())
+                if os.getppid() != self._parent_pid:
+                    raise RuntimeError(
+                        "内核已退出（心跳检测到父进程变化）——请结束控制器脚本")
+        finally:
+            poller.unregister(self._sock)
 
     def close(self) -> None:
         try:

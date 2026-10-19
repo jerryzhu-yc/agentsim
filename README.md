@@ -234,9 +234,9 @@ obs, reward, terminated, truncated, info = env.step(action)
 
 ```bash
 python -m pytest tests/ -q
-# 133 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 136 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot）/传感器（含 bit 级轨迹守护）/RL 环境
-#              （含逐位一致性守护）/场景生成/GUI
+#              （含逐位一致性守护）/控制器心跳/场景生成/GUI
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。
@@ -261,7 +261,7 @@ agentsim/
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 133 项测试
+└── tests/                 # 136 项测试
 ```
 
 ## Roadmap
@@ -270,12 +270,12 @@ agentsim/
 - [x] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染；run 后台线程化，30Hz 观测快照（`python -m agentsim gui`）
 - [x] M2 传感器系统 + MCP screenshot —— 五类传感器（encoder / IMU / 触觉 / 关节力矩 / 相机）YAML 声明进观测流，bit 级守护保证不改变物理轨迹；`screenshot` 工具让 Agent 截取仿真画面（自由机位或声明的相机机位）
 - [x] M3 RL 训练接口 —— `AgentSimEnv`（gymnasium.Env）：YAML 世界即确定性环境，动作/观测/奖励语义与内核一处实现（`kernel/task.py`），同 YAML 两遍轨迹逐位一致
-- [ ] M1 心跳机制（内核崩溃时控制器可感知退出）
+- [x] M1 心跳机制 —— 控制器 `_recv` 100ms poller 轮询 + `getppid` 孤儿检测：内核进程一死控制器必被 init/subreaper 收养（父 pid 变化），随即 `RuntimeError("内核已退出")` 退出；思考时间无限等待语义不变
 - [ ] 更多机器人模型（灵巧手、移动操作平台）
 
 ## 已知取舍（M0）
 
-- 内核进程被强杀（kill -9）时控制器可能成为孤儿阻塞——正常退出路径（EOF / close / reset）都会收尾控制器
+- ~~内核进程被强杀（kill -9）时控制器可能成为孤儿阻塞~~ **已由 M1 心跳机制补全**（`tests/test_heartbeat.py`：强杀内核后控制器 ≤2s 退出）
 - 无渲染：M0 是无头仿真，可视化留给 M1 GUI
 - MCP 实现为协议子集（initialize / ping / tools），覆盖主流客户端所需
 
