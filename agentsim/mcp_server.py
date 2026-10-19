@@ -162,6 +162,24 @@ _TOOLS = [
         "description": "回读当前世界的 YAML 原文（Agent 修改世界前先看）。",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "zoo_create",
+        "description": "从模型库（MuJoCo Menagerie 官方模型）生成可编辑项目："
+                       "世界 YAML + 控制器模板（含执行器清单与 API 注释），"
+                       "生成后 load_world 打开、改控制律即编程。"
+                       "首次用某模型会联网下载一次（之后永久离线）。"
+                       "key 列表见返回的 models 字段，或传 key='list' 只列清单。",
+        "inputSchema": {
+            "type": "object",
+            "required": ["key"],
+            "properties": {
+                "key": {"type": "string",
+                        "description": "模型 key（如 unitree_go2）或 'list'"},
+                "out_dir": {"type": "string",
+                            "description": "输出目录，缺省 ~/.agentsim/zoo/<key>"},
+            },
+        },
+    },
 ]
 
 
@@ -427,6 +445,21 @@ class AgentSimSession:
         if self.yaml_text is None:
             raise WorldError("还没有加载世界（先 load_world）")
         return self.yaml_text
+
+    def _tool_zoo_create(self, args: dict):
+        """模型库生成：key='list' 列清单，否则生成世界+控制器模板。"""
+        from agentsim.zoo import MODELS, generate
+        key = str(args.get("key", ""))
+        if key == "list":
+            return {"models": [
+                {"key": k, "title": m["title"], "category": m["cat"],
+                 "desc": m["desc"]}
+                for k, m in MODELS.items()]}
+        out_dir = args.get("out_dir")
+        r = generate(key, out_dir=out_dir)     # 未缓存模型会先下载一次
+        r["hint"] = ("已生成。load_world 打开 " + r["world"] +
+                     "，编辑 " + r["controller"] + " 写控制律后重新 run")
+        return r
 
     def _tool_screenshot(self, args: dict):
         """渲染当前状态为 PNG：内联 image content 或写盘。"""

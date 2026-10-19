@@ -9,8 +9,10 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+from PySide6.QtCore import QUrl, Qt, QTimer
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QCheckBox, QDialog, QFileDialog, QHBoxLayout,
+                               QLabel, QListWidget, QListWidgetItem,
                                QMainWindow, QPushButton, QSpinBox, QSplitter,
                                QVBoxLayout, QWidget)
 
@@ -19,6 +21,41 @@ from agentsim.gui.panels import make_side_panel
 from agentsim.gui.render_view import RenderView
 from agentsim.gui.state import UiState
 from agentsim.world.schema import load_world as parse_world_file
+
+
+class ZooDialog(QDialog):
+    """机器人模型库（MuJoCo Menagerie 官方模型）：选一个生成并打开。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("机器人模型库（MuJoCo Menagerie）")
+        self.resize(560, 560)
+        lay = QVBoxLayout(self)
+        tip = QLabel("预配置的官方模型。首次使用会联网下载一次（之后永久离线）；"
+                     "生成世界 + 控制器模板，自动打开编辑器写控制律。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        self.listw = QListWidget()
+        lay.addWidget(self.listw)
+        btn = QPushButton("生成并打开")
+        btn.setDefault(True)
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn)
+        self.listw.itemDoubleClicked.connect(lambda *_: self.accept)
+        self._populate()
+
+    def _populate(self):
+        from agentsim.zoo import MODELS
+        for key, m in MODELS.items():
+            it = QListWidgetItem(f"{m['title']}  [{m['cat']}] —— {m['desc']}")
+            it.setData(Qt.ItemDataRole.UserRole, key)
+            self.listw.addItem(it)
+        self.listw.setCurrentRow(0)
+
+    @property
+    def selected_key(self) -> str | None:
+        it = self.listw.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
 
 
 class MainWindow(QMainWindow):
@@ -38,6 +75,7 @@ class MainWindow(QMainWindow):
         self.view.setMinimumWidth(500)
         side.setMaximumWidth(420)
 
+        self.btn_zoo = QPushButton("模型库")
         self.btn_load = QPushButton("加载世界")
         self.btn_reset = QPushButton("Reset")
         self.btn_run = QPushButton("Run")
@@ -52,7 +90,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("启动中…")
         ctrl = QWidget()
         cl = QHBoxLayout(ctrl)
-        for w in (self.btn_load, self.btn_reset, self.btn_run,
+        for w in (self.btn_zoo, self.btn_load, self.btn_reset, self.btn_run,
                   self.btn_run_n, self.spin_n, self.chk_realtime):
             cl.addWidget(w)
         right = QWidget()
@@ -69,6 +107,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(split)
 
         # ---- 事件
+        self.btn_zoo.clicked.connect(self._on_zoo)
         self.btn_load.clicked.connect(self._on_load)
         self.btn_reset.clicked.connect(self._on_reset)
         self.btn_run.clicked.connect(self._on_run)
@@ -110,6 +149,33 @@ class MainWindow(QMainWindow):
             return
         self.client.call_tool("load_world", {"yaml_path": path},
                               lambda e, d: self._on_loaded(e, d, spec))
+
+    # ------------------------------------------------------------ 模型库
+    def _on_zoo(self):
+        dlg = ZooDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_key:
+            return
+        key = dlg.selected_key
+        self._apply_state(f"模型库：生成 {key} 中（首次使用需联网下载）…")
+        self.client.call_tool("zoo_create", {"key": key}, self._on_zoo_created)
+
+    def _on_zoo_created(self, err, data):
+        if err:
+            self._apply_state(f"zoo_create 失败: {data}")
+            return
+        world = data["world"]
+        try:
+            spec = parse_world_file(world)        # 本地解析（渲染模型用）
+        except Exception as e:
+            self._apply_state(f"生成的世界错误: {e}")
+            return
+        # 自动打开生成的世界 + 控制器模板（点击-打开-编程闭环）
+        self.client.call_tool("load_world", {"yaml_path": world},
+                              lambda e, d: self._on_loaded(e, d, spec))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(data["controller"]))
+        self._apply_state(
+            f"已生成并加载 {data['title']}。控制器已打开（{data['controller']}），"
+            f"改完控制律点 Run 重跑。")
 
     def _on_loaded(self, err, data, spec):
         if err:

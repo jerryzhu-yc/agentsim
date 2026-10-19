@@ -6,3 +6,4 @@ pyzmq              # 控制器进程 IPC（ZMQ REQ/ROUTER 栅栏同步）
 gymnasium          # RL 训练接口（agentsim.rl_env）；不训练可不装
 PySide6-Essentials  # 仅 GUI 需要（python -m agentsim gui）；无 GUI 可不装
 pytest             # 开发/测试
+mujoco-menagerie   # 可选：机器人模型库（M4，pip 装官方包；模型首次使用时下载缓存）

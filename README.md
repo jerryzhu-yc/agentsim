@@ -32,6 +32,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 - **进程级控制器隔离**：每个机器人的控制器是独立 OS 进程，通过 ZMQ REQ/ROUTER 与内核栅栏同步；控制器崩溃、超时都不会死锁内核
 - **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真，包括让 Agent 用 `screenshot` 截取仿真画面"亲眼"看世界
 - **传感器系统**：YAML 里给机器人声明 encoder / IMU / 触觉 / 关节力矩 / 相机五类传感器，编译进 MuJoCo 模型、读数进观测流，GUI 面板实时显示；传感器是只读派生量，不改变物理轨迹（bit 级守护测试保证）
+- **机器人模型库**：MuJoCo Menagerie 官方模型一键接入——预配置 13 个著名机器人（Unitree Go1/Go2/H1/G1、ANYmal C、Spot、Franka Panda、UR5e、xArm7、Shadow Hand、ALOHA 等），GUI 点"模型库"选模型即生成世界 + 控制器模板并自动打开编辑器，改完控制律点 Run 即跑；AI Agent 走同一条 `zoo_create` 工具
 - **RL 训练接口**：一个 YAML 世界 = 一个确定性 gymnasium.Env——动作空间 = 执行器拼接、观测 = qpos/qvel/传感器、reset 逐位一致（同 YAML 跑两遍轨迹逐 bit 相同，eval 可复现），单进程直驱不起 ZMQ，训练吞吐优先
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
 - **场景生成器**：5 个确定性模板（tabletop / push / maze / race / empty），同一命令 + 同一参数 = 逐字节相同的输出
@@ -86,6 +87,7 @@ python -m agentsim mcp
 | `save_state` / `load_state` | 内存快照，物理状态逐位恢复 |
 | `reset` | 世界回到 YAML 初态（重编译 + 控制器进程重启） |
 | `read_world` | 回读当前世界的 YAML 原文 |
+| `zoo_create` | 从模型库（MuJoCo Menagerie）生成可编辑项目：世界 YAML + 控制器模板（含执行器清单与 API 注释）；`key='list'` 只列清单 |
 
 Agent 的标准闭环：`read_world` → 修改 YAML → `load_world(yaml_text)` → `run` → `get_observation` → 观察成败 → 调整 → 重试。
 
@@ -100,6 +102,7 @@ python -m agentsim gui
 
 GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世界 YAML，后端经 stdio JSON-RPC 驱动同一个 `agentsim.mcp` 服务器——Run 时仿真跑在服务器后台线程，GUI 以 30Hz 拉取观测快照并渲染 MuJoCo 3D 画面 + 关节/物体面板。窗口里可以：
 
+- **模型库**：选 Menagerie 官方模型（首次联网下载一次）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器——点击-打开-编程闭环
 - **Load**：选择世界 YAML（解析在本地，坏文件直接报错）
 - **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
 - **实时勾选框**：勾选=按墙钟实时播放动画（1 仿真秒≈1 墙钟秒，MCP `run` 的 `realtime` 参数）；取消=全速推进瞬间出结果（跑批验证）
@@ -230,13 +233,33 @@ obs, reward, terminated, truncated, info = env.step(action)
 - **官方合规**：过 `gymnasium.utils.env_checker.check_env`；`render_mode="rgb_array"` 返回 (600,800,3) 截图（自由机位），SB3/CleanRL 等标准算法库可直接接
 - **确定性守护测试**：同动作序列两个 episode 逐 tick qpos `array_equal`（禁 allclose）
 
+## 机器人模型库（MuJoCo Menagerie）
+
+预配置 13 个著名机器人（`agentsim/zoo.py`）：Unitree Go1 / Go2 / H1 / G1、ANYmal C、Boston Dynamics Spot、Franka Emika Panda、UR5e、xArm7、Shadow Hand、ALOHA、Google Robot、Stretch 3——全部来自 DeepMind 官方精选模型库，经 MjSpec attach 编译进 AgentSim 世界（浮动基座四足/人形实测落地稳定）。
+
+**GUI 闭环**（`python -m agentsim gui`）：点"模型库"按钮 → 选模型（首次使用联网下载一次，之后永久离线）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器 → 改完控制律点 Run 重跑。
+
+**Agent / CLI 闭环**（与 GUI 同一条 MCP 工具）：
+
+```python
+r = tools.zoo_create(key="unitree_go2")   # 或 key="list" 先列清单
+# -> {"world": "~/.agentsim/zoo/unitree_go2/world.yaml",
+#     "controller": ".../controller.py", "actuators": [...12 个...]}
+tools.load_world(yaml_path=r["world"])
+tools.run(ticks=200)
+```
+
+生成的 `controller.py` 模板带完整执行器清单与 API 注释——AI Agent 可以直接读清单后改写控制律，人类用户用任意编辑器改写。依赖官方包 `mujoco-menagerie`（`pip install mujoco-menagerie`），模型资产缓存在 `~/.cache/mujoco_menagerie/`。
+
+> 已知语义：attach 时子模型的 MuJoCo option（impratio / cone 等）被父世界值覆盖——接触求解参数以世界 YAML 为准（`worlds/zoo` 生成模板已按各模型类目调好 floor 摩擦）。
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -q
-# 136 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
-#              MCP（含 screenshot）/传感器（含 bit 级轨迹守护）/RL 环境
-#              （含逐位一致性守护）/控制器心跳/场景生成/GUI
+# 141 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+#              MCP（含 screenshot/zoo_create）/传感器（含 bit 级轨迹守护）/
+#              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。
@@ -249,6 +272,7 @@ agentsim/
 │   ├── kernel/sim.py      # 仿真内核：ZMQ ROUTER + 栅栏同步推进
 │   ├── kernel/task.py    # 任务评估 + 观测组装纯函数（内核与 RL env 共用）
 │   ├── rl_env.py          # gymnasium.Env 包装（RL 训练接口）
+│   ├── zoo.py              # 机器人模型库（Menagerie 13 个预配置模型 + 生成器）
 │   ├── controller.py      # 控制器侧 Robot 客户端（用户唯一 API）
 │   ├── world/schema.py    # YAML → dataclass，前置校验
 │   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译
@@ -261,7 +285,7 @@ agentsim/
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 136 项测试
+└── tests/                 # 141 项测试
 ```
 
 ## Roadmap
@@ -271,7 +295,7 @@ agentsim/
 - [x] M2 传感器系统 + MCP screenshot —— 五类传感器（encoder / IMU / 触觉 / 关节力矩 / 相机）YAML 声明进观测流，bit 级守护保证不改变物理轨迹；`screenshot` 工具让 Agent 截取仿真画面（自由机位或声明的相机机位）
 - [x] M3 RL 训练接口 —— `AgentSimEnv`（gymnasium.Env）：YAML 世界即确定性环境，动作/观测/奖励语义与内核一处实现（`kernel/task.py`），同 YAML 两遍轨迹逐位一致
 - [x] M1 心跳机制 —— 控制器 `_recv` 100ms poller 轮询 + `getppid` 孤儿检测：内核进程一死控制器必被 init/subreaper 收养（父 pid 变化），随即 `RuntimeError("内核已退出")` 退出；思考时间无限等待语义不变
-- [ ] 更多机器人模型（灵巧手、移动操作平台）
+- [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（13 个预配置著名机器人），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
 
 ## 已知取舍（M0）
 
