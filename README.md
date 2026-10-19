@@ -32,6 +32,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 - **进程级控制器隔离**：每个机器人的控制器是独立 OS 进程，通过 ZMQ REQ/ROUTER 与内核栅栏同步；控制器崩溃、超时都不会死锁内核
 - **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真，包括让 Agent 用 `screenshot` 截取仿真画面"亲眼"看世界
 - **传感器系统**：YAML 里给机器人声明 encoder / IMU / 触觉 / 关节力矩 / 相机五类传感器，编译进 MuJoCo 模型、读数进观测流，GUI 面板实时显示；传感器是只读派生量，不改变物理轨迹（bit 级守护测试保证）
+- **RL 训练接口**：一个 YAML 世界 = 一个确定性 gymnasium.Env——动作空间 = 执行器拼接、观测 = qpos/qvel/传感器、reset 逐位一致（同 YAML 跑两遍轨迹逐 bit 相同，eval 可复现），单进程直驱不起 ZMQ，训练吞吐优先
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
 - **场景生成器**：5 个确定性模板（tabletop / push / maze / race / empty），同一命令 + 同一参数 = 逐字节相同的输出
 - **零重量依赖**：核心只依赖 mujoco / numpy / pyyaml / pyzmq，MCP 层不依赖任何 SDK
@@ -205,12 +206,37 @@ while robot.step():                 # 推进一 tick，返回观测；内核叫�
 
 控制器与内核是独立进程锁步（每个 step 请求有且只有一个回复）。控制器可以无限等待内核开跑（Agent 的"思考时间"不会杀死控制器）；内核会在 run 结束时通知控制器收尾。
 
+## RL 训练接口（gymnasium）
+
+一个 YAML 世界 = 一个确定性 gym 环境。`reset` 重建 `MjData`，同 YAML 跑两遍轨迹逐 bit 相同——eval 可复现是 AgentSim 的差异化卖点：
+
+```python
+from agentsim.rl_env import AgentSimEnv
+
+env = AgentSimEnv("worlds/pick_cube.yaml")     # YAML 路径 / dict / WorldSpec
+obs, info = env.reset(seed=42)
+obs, reward, terminated, truncated, info = env.step(action)
+# action  = 所有机器人执行器按声明顺序拼接（Box，界 = 各自 ctrlrange）
+# obs     = 各机器人 qpos + qvel + 传感器读数拼接（float32）
+# reward  = 世界 task.reward 的当步加权值；terminated = task.success；
+#           truncated = tick 到 max_ticks
+# info    = {"tick", "time", "raw": {机器人: {qpos/qvel/ctrl/sensors}}}（float64）
+```
+
+设计要点：
+
+- **单进程直驱**：不走控制器子进程、不起 ZMQ，训练吞吐优先；MCP/内核零改动
+- **语义一处实现**：任务评估与观测组装和内核共用 `kernel/task.py`，两路不会漂移
+- **官方合规**：过 `gymnasium.utils.env_checker.check_env`；`render_mode="rgb_array"` 返回 (600,800,3) 截图（自由机位），SB3/CleanRL 等标准算法库可直接接
+- **确定性守护测试**：同动作序列两个 episode 逐 tick qpos `array_equal`（禁 allclose）
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -q
-# 122 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
-#              MCP（含 screenshot）/传感器（含 bit 级轨迹守护）/场景生成/GUI
+# 133 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+#              MCP（含 screenshot）/传感器（含 bit 级轨迹守护）/RL 环境
+#              （含逐位一致性守护）/场景生成/GUI
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。
@@ -221,6 +247,8 @@ python -m pytest tests/ -q
 agentsim/
 ├── agentsim/
 │   ├── kernel/sim.py      # 仿真内核：ZMQ ROUTER + 栅栏同步推进
+│   ├── kernel/task.py    # 任务评估 + 观测组装纯函数（内核与 RL env 共用）
+│   ├── rl_env.py          # gymnasium.Env 包装（RL 训练接口）
 │   ├── controller.py      # 控制器侧 Robot 客户端（用户唯一 API）
 │   ├── world/schema.py    # YAML → dataclass，前置校验
 │   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译
@@ -233,7 +261,7 @@ agentsim/
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 122 项测试
+└── tests/                 # 133 项测试
 ```
 
 ## Roadmap
@@ -241,9 +269,9 @@ agentsim/
 - [x] M0 仿真内核（物理 / 进程隔离 / Supervisor / MCP / 场景生成）
 - [x] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染；run 后台线程化，30Hz 观测快照（`python -m agentsim gui`）
 - [x] M2 传感器系统 + MCP screenshot —— 五类传感器（encoder / IMU / 触觉 / 关节力矩 / 相机）YAML 声明进观测流，bit 级守护保证不改变物理轨迹；`screenshot` 工具让 Agent 截取仿真画面（自由机位或声明的相机机位）
+- [x] M3 RL 训练接口 —— `AgentSimEnv`（gymnasium.Env）：YAML 世界即确定性环境，动作/观测/奖励语义与内核一处实现（`kernel/task.py`），同 YAML 两遍轨迹逐位一致
 - [ ] M1 心跳机制（内核崩溃时控制器可感知退出）
 - [ ] 更多机器人模型（灵巧手、移动操作平台）
-- [ ] RL 训练接口（gym.Env 封装）
 
 ## 已知取舍（M0）
 

@@ -24,12 +24,10 @@ import zmq
 
 from agentsim import supervisor
 from agentsim.errors import WorldError
+from agentsim.kernel.task import (robot_obs, sensors_obs, task_reward,
+                                  task_success)
 from agentsim.world.builder import build_world, resolve_task
 from agentsim.world.schema import WorldSpec
-
-# 关节类型 -> qpos 占用宽度
-_QPOS_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): 7,
-               int(mujoco.mjtJoint.mjJNT_BALL): 4}
 
 
 class Simulation:
@@ -241,13 +239,7 @@ class Simulation:
 
     def _obs_msg(self, robot_name: str) -> dict:
         ridx = self.index.robots[robot_name]
-        qpos, qvel = [], []
-        for jid in ridx.joints.values():
-            w = _QPOS_WIDTH.get(int(self.model.jnt_type[jid]), 1)
-            adr = self.model.jnt_qposadr[jid]
-            qpos += list(map(float, self.data.qpos[adr:adr + w]))
-            vadr = self.model.jnt_dofadr[jid]
-            qvel += list(map(float, self.data.qvel[vadr:vadr + w]))
+        qpos, qvel = robot_obs(ridx, self.model, self.data)
         bodies = {name: [float(x) for x in self.data.xpos[bid]]
                   for name, bid in ridx.bodies.items()}
         # 场景物体全局可见（控制闭环需要：抓取要看着 cube 的位置）
@@ -260,15 +252,10 @@ class Simulation:
             "joint_names": list(ridx.joints), "qpos": qpos, "qvel": qvel,
             "bodies": bodies, "objects": objects,
         }
-        # 传感器读数（声明过的机器人才有这个键；sensordata 在 mj_step 末尾已就绪）
+        # 传感器读数（声明过的机器人才有这个键；sensordata 在 mj_step 末尾已就绪；
+        # 拼接语义见 kernel/task.py，与 RL env 共用）
         if ridx.sensors:
-            sensors = {}
-            for sname, six in ridx.sensors.items():
-                vals = []
-                for adr, dim in six.parts:
-                    vals += list(map(float, self.data.sensordata[adr:adr + dim]))
-                sensors[sname] = vals[0] if six.dim == 1 else vals
-            msg["sensors"] = sensors
+            msg["sensors"] = sensors_obs(ridx, self.data)
         return msg
 
     def _check_crashes(self) -> None:
@@ -403,35 +390,12 @@ class Simulation:
         return True
 
     def _task_success(self) -> bool | None:
-        """终态任务判定：成功 body 的 xpos 落在 zone 内。无任务返回 None。"""
-        if self.task.success_body is None:
-            return None
-        p = self.data.xpos[self.task.success_body]
-        lo = np.asarray(self.task.success_min)
-        hi = np.asarray(self.task.success_max)
-        return bool(np.all(p >= lo) and np.all(p <= hi))
+        """终态任务判定（语义实现见 kernel/task.py，与 RL env 共用）。"""
+        return task_success(self.task, self.data)
 
     def _task_reward(self) -> float:
-        """终态奖励值（分项求和）。"""
-        total = 0.0
-        for kind, ia, ib, w in self.task.rewards:
-            if kind == "distance":
-                total += w * float(np.linalg.norm(
-                    self.data.xpos[ia] - self.data.xpos[ib]))
-            elif kind == "zone":
-                p = self.data.xpos[ia]
-                lo, hi = np.asarray(ib[0]), np.asarray(ib[1])
-                total += w * float(np.all(p >= lo) and np.all(p <= hi))
-            elif kind == "contact":
-                # a/b 是 body id，contact 里是 geom id：经 geom_bodyid 对齐
-                pair = {ia, ib}
-                hit = any(
-                    {self.model.geom_bodyid[self.data.contact[i].geom1],
-                     self.model.geom_bodyid[self.data.contact[i].geom2]}
-                    == pair
-                    for i in range(self.data.ncon))
-                total += w * float(hit)
-        return total
+        """终态奖励值（语义实现见 kernel/task.py，与 RL env 共用）。"""
+        return task_reward(self.task, self.model, self.data)
 
     def _stats(self, t_start: float, sim_start: float) -> dict:
         return {
