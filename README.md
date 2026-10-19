@@ -88,7 +88,23 @@ Agent 的标准闭环：`read_world` → 修改 YAML → `load_world(yaml_text)`
 
 > 语义提示：`run` 是一次性 episode——返回时本轮控制器已收尾退出；继续推进请 `reset` 后重跑，或改世界后重新 `load_world`。
 
-### 3. 从模板生成场景
+### 3. 桌面 GUI 实时可视化
+
+```bash
+pip install PySide6-Essentials   # GUI 可选依赖
+python -m agentsim gui
+```
+
+GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世界 YAML，后端经 stdio JSON-RPC 驱动同一个 `agentsim.mcp` 服务器——Run 时仿真跑在服务器后台线程，GUI 以 30Hz 拉取观测快照并渲染 MuJoCo 3D 画面 + 关节/物体面板。窗口里可以：
+
+- **Load**：选择世界 YAML（解析在本地，坏文件直接报错）
+- **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
+- **实时勾选框**：勾选=按墙钟实时播放动画（1 仿真秒≈1 墙钟秒，MCP `run` 的 `realtime` 参数）；取消=全速推进瞬间出结果（跑批验证）
+- **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放
+
+> run 期间 `get_observation` 返回 33ms 节流的运动学快照（含物体位置 + 四元数），不影响物理轨迹。
+
+### 4. 从模板生成场景
 
 ```bash
 python -m agentsim scenegen maze --rows 4 --cols 4 --out worlds/my_maze.yaml
@@ -191,18 +207,19 @@ agentsim/
 │   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译
 │   ├── supervisor.py      # 快照/teleport（逐位可复现）
 │   ├── mcp_server.py      # MCP stdio 服务器（零依赖 JSON-RPC）
+│   ├── gui/               # PySide6 桌面 GUI（app / render_view / panels / mcp_client）
 │   ├── scene_gen.py       # 5 个确定性场景模板
-│   └── cli.py             # run / mcp / scenegen 命令行
+│   └── cli.py             # run / mcp / gui / scenegen 命令行
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 71 项测试
+└── tests/                 # 87 项测试
 ```
 
 ## Roadmap
 
 - [x] M0 仿真内核（物理 / 进程隔离 / Supervisor / MCP / 场景生成，71 项测试）
-- [ ] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染，内核已备好 `run(on_tick=)` 观测钩子
+- [x] M1 GUI（PySide6 可视化 + 实时观测面板）—— [实施方案](docs/M1_GUI实施计划.md)：GUI 作为 MCP 客户端（与 AI Agent 同构）+ MuJoCo 离屏渲染；run 后台线程化，30Hz 观测快照（`python -m agentsim gui`）
 - [ ] M1 心跳机制（内核崩溃时控制器可感知退出）
 - [ ] 更多机器人模型与传感器（关节力矩、触觉、相机）
 - [ ] RL 训练接口（gym.Env 封装）

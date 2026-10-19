@@ -221,6 +221,9 @@ def build_world(spec: WorldSpec) -> tuple[mujoco.MjModel, NameIndex]:
     mj.modelname = spec.name
     mj.option.timestep = spec.timestep
     mj.option.gravity = list(spec.gravity)
+    # 离屏帧缓冲调大：GUI 渲染视口可达 ~1600px，默认 640 会抛异常
+    mj.visual.global_.offwidth = 1920
+    mj.visual.global_.offheight = 1440
 
     _build_scene(spec, mj)
     for rd in spec.robots:

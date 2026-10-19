@@ -3,6 +3,7 @@
 用法：
     python -m agentsim run worlds/pick_cube.yaml [--ticks N]
     python -m agentsim mcp                     # MCP stdio 服务器（AI Agent 接入）
+    python -m agentsim gui                     # 桌面 GUI（PySide6，需装 PySide6-Essentials）
 """
 import argparse
 import json
@@ -18,6 +19,7 @@ def main(argv=None):
     run_p.add_argument("--json", action="store_true",
                        help="以 JSON 输出统计（机器可读）")
     sub.add_parser("mcp", help="启动 MCP stdio 服务器")
+    sub.add_parser("gui", help="启动桌面 GUI（可视化 + 观测面板）")
     gen_p = sub.add_parser("scenegen", help="从模板生成世界 YAML")
     gen_p.add_argument("template", help="模板名")
     gen_p.add_argument("--out", default=None,
@@ -32,6 +34,13 @@ def main(argv=None):
     elif args.cmd == "mcp":
         from agentsim.mcp_server import serve
         serve()
+    elif args.cmd == "gui":
+        try:
+            from agentsim.gui import main as gui_main
+        except ImportError as e:
+            raise SystemExit(
+                f"GUI 需要 PySide6：pip install PySide6-Essentials（{e}）")
+        raise SystemExit(gui_main())
     elif args.cmd == "scenegen":
         _scenegen(args, argv)
 

@@ -278,11 +278,15 @@ class Simulation:
     # ---------------------------------------------------------------- 主循环
 
     def run(self, max_ticks: int | None = None,
-            on_tick: "callable | None" = None) -> dict:
+            on_tick: "callable | None" = None,
+            realtime: bool | None = None) -> dict:
         """推进仿真，返回统计。max_ticks 缺省用世界 task.max_ticks（再缺省 10000）。
 
         on_tick(tick)：每个控制 tick 推进后的回调（GUI/MCP 用来抽观测快照）。
         回调在同一线程内同步调用，此时 data 处于一致状态，可安全读取。
+
+        realtime：True/False 覆盖世界 runtime.realtime；None 用世界设置。
+        开启后按墙钟对齐仿真时间（GUI 看动画用；机器跑批应关闭以全速推进）。
         """
         if max_ticks is None:
             max_ticks = self.spec.task.max_ticks
@@ -290,8 +294,19 @@ class Simulation:
             max_ticks = 10_000
         timeout_ms = int(self.spec.runtime.controller_timeout)   # schema 单位就是 ms
         policy = self.spec.runtime.timeout_policy
-        realtime = self.spec.runtime.realtime
+        if realtime is None:
+            realtime = self.spec.runtime.realtime
         t_start, sim_start = time.perf_counter(), self.data.time
+
+        def _pace():
+            """实时节流：把墙钟对齐到当前仿真时间。"""
+            if not realtime:
+                return
+            target = sim_start + (self.tick * self.spec.ctrl_period
+                                  * self.spec.timestep)
+            behind = target - (time.perf_counter() - t_start)
+            if behind > 0:
+                time.sleep(behind)
 
         # 无控制器的世界：直接空跑（scene_gen 冒烟等用途）
         if not self._procs:
@@ -301,6 +316,7 @@ class Simulation:
                 self.tick += 1
                 if on_tick is not None:
                     on_tick()
+                _pace()
             return self._stats(t_start, sim_start)
 
         # 等所有控制器完成握手（进程死光则放弃等待）
@@ -332,12 +348,7 @@ class Simulation:
                         self._st[name]["pending"] = 1
                         self._st[name]["lag"] += 1
             # pause: 什么都不做，下一轮继续等
-            if realtime:
-                target = sim_start + (self.tick * self.spec.ctrl_period
-                                      * self.spec.timestep)
-                behind = target - (time.perf_counter() - t_start)
-                if behind > 0:
-                    time.sleep(behind)
+            _pace()
 
         self._notify_stop()
         self._drain_controllers()

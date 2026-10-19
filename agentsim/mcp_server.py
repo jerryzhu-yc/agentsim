@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import threading
+import time
 
 import mujoco
 import yaml
@@ -29,6 +31,13 @@ from agentsim.world.schema import load_world as _load_world_file
 from agentsim.world.schema import parse_world
 
 _PROTOCOL = "2024-11-05"
+
+# run 的响应被推迟（后台线程跑完才写回）时 dispatch 返回此哨兵，
+# serve 主循环见到它不写 stdout（响应由 run 线程经 Writer 写）。
+_DEFERRED = object()
+
+# 观测快照节流：GUI 30Hz 拉观测，每 tick 生成快照没必要
+_SNAP_INTERVAL = 0.033
 
 _JTYPE_NAME = {int(mujoco.mjtJoint.mjJNT_HINGE): "hinge",
                int(mujoco.mjtJoint.mjJNT_SLIDE): "slide",
@@ -57,17 +66,20 @@ _TOOLS = [
     },
     {
         "name": "run",
-        "description": "全速推进仿真并返回摘要（ticks/success/reward/物体终位）。"
+        "description": "推进仿真并返回摘要（ticks/success/reward/物体终位）。"
                        "缺省跑到终态（控制器退出/世界 max_ticks）；ticks=N 只推进 N 步。"
+                       "run 在后台线程执行：期间可以继续 get_observation（返回实时快照，"
+                       "GUI 实时可视化的基础）；本条响应会等 run 结束才返回。"
                        "注意：run 返回时本轮控制器已收尾退出，继续推进请 reset 后重跑，"
-                       "或改世界后重新 load_world。",
+                       "或改世界后重新 load_world。同一时刻只允许一个 run。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "ticks": {"type": "integer", "minimum": 1,
                           "description": "本段推进的 tick 数上限"},
-                "until_done": {"type": "boolean",
-                               "description": "一直跑到终态（默认）"},
+                "realtime": {"type": "boolean",
+                             "description": "按墙钟实时节流（看动画用，1 仿真秒≈1 墙钟秒）；"
+                                            "缺省 false 全速推进"},
             },
         },
     },
@@ -125,6 +137,14 @@ class AgentSimSession:
         self.spec = None
         self.sim: Simulation | None = None
         self.yaml_text: str | None = None
+        # run 后台线程化（GUI 实时观测的基础）
+        self._run_thread: threading.Thread | None = None
+        self._snap = None                 # run 期间最新观测快照（run 线程写）
+        self._snap_t = 0.0
+        self._snap_lock = threading.Lock()
+        self._run_req = None              # (req_id, writer)：run 结束后写延迟响应
+        self._run_error: BaseException | None = None
+        self._last_stats: dict | None = None
 
     # ------------------------------------------------------------ 工具入口
 
@@ -136,7 +156,14 @@ class AgentSimSession:
                              f"{sorted(t['name'] for t in _TOOLS)}")
         return handler(args or {})
 
+    @property
+    def is_running(self) -> bool:
+        return self._run_thread is not None and self._run_thread.is_alive()
+
     def close(self):
+        # run 还在跑（如 realtime 世界）：给它一点时间收尾，等不及就随进程退出
+        if self.is_running and threading.current_thread() is not self._run_thread:
+            self._run_thread.join(timeout=5)
         if self.sim is not None:
             self.sim.close()
             self.sim = None
@@ -144,6 +171,7 @@ class AgentSimSession:
     # ------------------------------------------------------------ 各工具
 
     def _tool_load_world(self, args: dict):
+        self._require_idle()
         path, text = args.get("yaml_path"), args.get("yaml_text")
         if (path is None) == (text is None):
             raise WorldError("load_world 需要 yaml_path 或 yaml_text 恰好一个")
@@ -171,31 +199,118 @@ class AgentSimSession:
         }
 
     def _tool_run(self, args: dict):
+        """会话层同步语义：起后台线程并等它跑完（旧 API 行为不变）。
+
+        stdio 协议层（dispatch）走 start_run(block=False)：响应推迟到
+        run 结束，期间 serve 循环继续应答 get_observation 等请求。
+        """
+        return self.start_run(args, block=True)
+
+    def start_run(self, args: dict, req_id=None, writer=None, block: bool = False):
+        """启动后台 run。返回 _DEFERRED（异步）或 stats dict（block=True）。
+
+        WorldError（未加载世界/并发 run）同步抛出。
+        """
         sim = self._require_sim()
+        if self.is_running:
+            raise WorldError("已有 run 在进行中，等它结束（或完成后 reset）")
         ticks = args.get("ticks")
-        if ticks is not None:
-            stats = sim.run(max_ticks=sim.tick + int(ticks))
-        else:
-            stats = sim.run()          # until_done / 缺省：跑到终态
-        stats = dict(stats)
-        stats["objects"] = {name: [round(float(x), 4) for x in sim.data.xpos[bid]]
-                            for name, bid in self.sim.index.objects.items()}
+        max_ticks = (sim.tick + int(ticks)) if ticks is not None else None
+        realtime = bool(args.get("realtime", False))
+        self._run_error = None
+        self._run_req = (req_id, writer) if req_id is not None else None
+        self._snap = None
+        self._snap_t = 0.0
+
+        def job():
+            try:
+                stats = self._run_job(max_ticks, realtime)
+            except BaseException as e:      # 线程里异常不能无声吞掉
+                self._run_error = e
+                stats = {"error": f"{type(e).__name__}: {e}"}
+            self._write_run_response(stats)
+
+        self._run_thread = threading.Thread(target=job, daemon=True,
+                                            name="agentsim-run")
+        self._run_thread.start()
+        if block:
+            self._run_thread.join()
+            if self._run_error is not None:
+                raise self._run_error
+            return self._last_stats
+        return _DEFERRED
+
+    def _run_job(self, max_ticks, realtime=False):
+        sim = self.sim               # 线程里重取（load_world 会换实例）
+        stats = dict(sim.run(max_ticks=max_ticks, on_tick=self._on_tick,
+                             realtime=realtime))
+        stats["objects"] = self._objects_pos(sim)
+        self._last_stats = stats
         return stats
 
-    def _tool_get_observation(self, args: dict):
-        sim = self._require_sim()
+    def _on_tick(self):
+        """内核每个 tick 回调（run 线程内，data 状态一致可安全读）。"""
+        now = time.perf_counter()
+        if now - self._snap_t < _SNAP_INTERVAL:
+            return
+        self._snap_t = now
+        with self._snap_lock:
+            self._snap = self._obs_payload()
+
+    def _write_run_response(self, stats):
+        if self._run_req is not None:
+            req_id, writer = self._run_req
+            self._run_req = None
+            if writer is not None:
+                is_err = "error" in stats
+                writer.write(_rpc_result(req_id, {
+                    "content": [{"type": "text",
+                                 "text": json.dumps(stats, ensure_ascii=False)}],
+                    "isError": is_err}))
+
+    def _objects_pos(self, sim) -> dict:
+        return {name: [round(float(x), 4) for x in sim.data.xpos[bid]]
+                for name, bid in sim.index.objects.items()}
+
+    def _obs_payload(self) -> dict:
+        """完整观测（含物体 pos+quat）。调用方保证此刻没有并发 mj_step。"""
+        sim = self.sim
+        # xpos/xquat 是派生量：刚 load（还没跑过 step）或 load_state 恢复后
+        # 都是过期/零值。mj_kinematics 只重算运动学，不碰 warmstart，
+        # 对 bit 级轨迹重现无影响。
+        mujoco.mj_kinematics(sim.model, sim.data)
         robots = {}
         for rname in sim.index.robots:
             obs = sim._obs_msg(rname)
             obs.pop("op", None)
             robots[rname] = obs
+        objects = {}
+        for name, bid in sim.index.objects.items():
+            objects[name] = {
+                "pos": [round(float(x), 4) for x in sim.data.xpos[bid]],
+                "quat": [round(float(x), 4) for x in sim.data.xquat[bid]],
+            }
         return {
             "tick": sim.tick,
             "time": round(float(sim.data.time), 4),
+            "running": self.is_running,
             "robots": robots,
+            "objects": objects,
             "task": {"success": sim._task_success(),
                      "reward": round(sim._task_reward(), 4)},
         }
+
+    def _tool_get_observation(self, args: dict):
+        sim = self._require_sim()
+        if self.is_running:
+            # run 期间 data 正被 run 线程 mj_step，直接读有竞态——返回快照
+            with self._snap_lock:
+                snap = self._snap
+            if snap is not None:
+                return snap
+            return {"running": True, "tick": sim.tick,
+                    "note": "首帧快照未生成（run 刚启动）"}
+        return self._obs_payload()
 
     def _tool_get_robot_manifest(self, args: dict):
         sim = self._require_sim()
@@ -234,6 +349,7 @@ class AgentSimSession:
         }
 
     def _tool_save_state(self, args: dict):
+        self._require_idle()
         sim = self._require_sim()
         tag = args.get("tag")
         if not tag:
@@ -243,6 +359,7 @@ class AgentSimSession:
                 "tags": supervisor.list_tags(sim._snaps)}
 
     def _tool_load_state(self, args: dict):
+        self._require_idle()
         sim = self._require_sim()
         tag = args.get("tag")
         if not tag:
@@ -252,6 +369,7 @@ class AgentSimSession:
                 "tags": supervisor.list_tags(sim._snaps)}
 
     def _tool_reset(self, args: dict):
+        self._require_idle()
         if self.spec is None:
             raise WorldError("还没有加载世界（先 load_world）")
         self.close()
@@ -265,6 +383,11 @@ class AgentSimSession:
 
     # ------------------------------------------------------------ 辅助
 
+    def _require_idle(self):
+        """run 进行中禁止换世界/动状态（否则 run 线程会用着已 close 的 sim）。"""
+        if self.is_running:
+            raise WorldError("run 正在进行中，此操作需要等它结束")
+
     def _require_sim(self) -> Simulation:
         if self.sim is None:
             raise WorldError("还没有加载世界（先 load_world）")
@@ -272,6 +395,19 @@ class AgentSimSession:
 
 
 # ---------------------------------------------------------------- JSON-RPC / MCP 协议
+
+class _Writer:
+    """线程安全写出器：serve 线程与 run 线程共用 stdout。"""
+
+    def __init__(self, out):
+        self._out = out
+        self._lock = threading.Lock()
+
+    def write(self, obj) -> None:
+        with self._lock:
+            self._out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            self._out.flush()
+
 
 def _rpc_result(req_id, result):
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -282,8 +418,9 @@ def _rpc_error(req_id, code: int, message: str):
             "error": {"code": code, "message": message}}
 
 
-def dispatch(session: AgentSimSession, method: str, params: dict, req_id):
-    """单个 JSON-RPC 请求 -> 响应 dict（通知返回 None）。"""
+def dispatch(session: AgentSimSession, method: str, params: dict, req_id,
+             writer: _Writer | None = None):
+    """单个 JSON-RPC 请求 -> 响应 dict（通知返回 None，延迟响应返回 _DEFERRED）。"""
     if req_id is None:            # 通知：静默接受
         return None
     if method == "initialize":
@@ -301,6 +438,15 @@ def dispatch(session: AgentSimSession, method: str, params: dict, req_id):
         params = params or {}
         name = params.get("name", "")
         args = params.get("arguments") or {}
+        if name == "run":
+            # run 后台线程化：响应推迟到跑完（GUI 实时观测的基础）。
+            # 校验类错误（未加载世界/并发 run）仍同步返回。
+            try:
+                return session.start_run(args, req_id, writer, block=False)
+            except WorldError as e:
+                return _rpc_result(req_id, {
+                    "content": [{"type": "text", "text": str(e)}],
+                    "isError": True})
         try:
             result = session.call_tool(name, args)
         except WorldError as e:
@@ -317,6 +463,7 @@ def dispatch(session: AgentSimSession, method: str, params: dict, req_id):
 def serve(stdin=sys.stdin, stdout=sys.stdout) -> None:
     """MCP stdio 主循环：每行一个 JSON-RPC 消息。"""
     session = AgentSimSession()
+    writer = _Writer(stdout)
     for line in stdin:
         line = line.strip()
         if not line:
@@ -333,13 +480,12 @@ def serve(stdin=sys.stdin, stdout=sys.stdout) -> None:
             else:
                 try:
                     resp = dispatch(session, method, req.get("params"),
-                                    req.get("id"))
+                                    req.get("id"), writer)
                 except Exception as e:      # 内部错误兜底：进程绝不能死
                     resp = _rpc_error(req.get("id"), -32603,
                                       f"内部错误: {type(e).__name__}: {e}")
-        if resp is not None:
-            stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            stdout.flush()
+        if resp is not None and resp is not _DEFERRED:
+            writer.write(resp)
     session.close()
 
 

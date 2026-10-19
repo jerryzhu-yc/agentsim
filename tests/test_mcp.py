@@ -151,6 +151,100 @@ class TestAgentLoop:
         finally:
             s.close()
 
+    def test_observation_has_object_quat(self):
+        """get_observation 顶层 objects 带 pos+quat（GUI 渲染写 freejoint 需要）。"""
+        s = AgentSimSession()
+        try:
+            s.call_tool("load_world", {"yaml_path": str(WORLD)})
+            obs = s.call_tool("get_observation", {})
+            cube = obs["objects"]["cube"]
+            assert len(cube["pos"]) == 3
+            q = cube["quat"]
+            assert len(q) == 4
+            assert abs(sum(x * x for x in q) - 1.0) < 1e-6   # 单位四元数
+        finally:
+            s.close()
+
+    def test_run_streaming_observation(self):
+        """run 后台线程化：run 进行中 get_observation 返回实时快照（tick 在涨），
+        不等 run 结束、不死锁——GUI 实时可视化的地基。"""
+        import threading
+        import time
+        text = WORLD.read_text(encoding="utf-8")
+        text = text.replace("controller: ../controllers/pick_place.py", "controller:")
+        text = text.replace("max_ticks: 5000", "max_ticks: 50000")
+        s = AgentSimSession()
+        t = None
+        try:
+            s.call_tool("load_world", {"yaml_text": text,
+                                       "base_dir": str(ROOT / "worlds")})
+            done = {}
+
+            def runner():
+                done["stats"] = s.call_tool("run", {})
+
+            t = threading.Thread(target=runner)
+            t.start()
+            time.sleep(1.0)                     # run 进行中（全速也要跑数秒）
+            obs = s.call_tool("get_observation", {})
+            assert obs.get("running") is True, obs
+            assert 0 < obs["tick"] < 50000, obs
+            t.join(timeout=60)
+            assert done["stats"]["ticks"] == 50000
+        finally:
+            if t is not None and t.is_alive():
+                t.join(timeout=60)
+            s.close()
+
+    def test_stdio_async_run_interleaved_response(self):
+        """stdio 层：run 响应推迟到跑完，期间 ping 立即应答且先到
+        （GUI 的请求乱序到达必须按 id 匹配）。"""
+        import subprocess
+        import sys as _sys
+        import time
+        root = pathlib.Path(__file__).resolve().parents[1]
+        proc = subprocess.Popen(
+            [_sys.executable, "-m", "agentsim", "mcp"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, cwd=str(root), text=True)
+        try:
+            def send(obj):
+                proc.stdin.write(json.dumps(obj) + "\n")
+                proc.stdin.flush()
+
+            def read_until(pred, timeout=30):
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    line = proc.stdout.readline()
+                    if not line:
+                        raise AssertionError("MCP 服务器提前退出")
+                    resp = json.loads(line)
+                    if pred(resp):
+                        return resp
+                raise AssertionError("等待响应超时")
+
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {}})
+            read_until(lambda r: r["id"] == 1)
+            send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "load_world",
+                             "arguments": {"yaml_path": str(WORLD)}}})
+            r = read_until(lambda r: r["id"] == 2)
+            assert not r["result"]["isError"]
+
+            # run（响应会推迟）紧跟 ping（应立即先回）
+            send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                  "params": {"name": "run", "arguments": {}}})
+            send({"jsonrpc": "2.0", "id": 4, "method": "ping"})
+            r_ping = read_until(lambda r: r["id"] == 4)
+            assert r_ping["result"] == {}
+            r_run = read_until(lambda r: r["id"] == 3)
+            stats = json.loads(r_run["result"]["content"][0]["text"])
+            assert stats["ticks"] > 0 and "success" in stats
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=15)
+
 
 class TestStdioProtocol:
     def test_jsonrpc_over_stdio(self):
