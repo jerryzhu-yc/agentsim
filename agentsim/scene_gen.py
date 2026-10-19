@@ -101,7 +101,7 @@ def _tpl_tabletop(p, base):
         "max_ticks": 5000,
     }
     return _base_world(f"tabletop_{n}", [table] + cubes,
-                       [_robot("arm", "demo_arm.xml", base, (0, 0, 0))], task)
+                       [_robot("arm", "demo_arm.xml", base, (0, 0, 0.05))], task)
 
 
 def _tpl_push(p, base):
@@ -118,7 +118,7 @@ def _tpl_push(p, base):
         "max_ticks": 5000,
     }
     w = _base_world("push_cube", [cube],
-                    [_robot("arm", "demo_arm.xml", base, (0, 0, 0),
+                    [_robot("arm", "demo_arm.xml", base, (0, 0, 0.05),
                             controller="pick_place.py")], task)
     w["scene"]["floor"]["friction"] = 0.3
     return w
@@ -206,9 +206,9 @@ def _tpl_empty(p, base):
         raise WorldError(f"参数 robot 需要是 arm/diff_car/none，实际是: {kind!r}")
     robots = []
     if kind == "arm":
-        robots.append(_robot("arm", "demo_arm.xml", base, (0, 0, 0)))
+        robots.append(_robot("arm", "demo_arm.xml", base, (0, 0, 0.05)))
     elif kind == "diff_car":
-        robots.append(_robot("car", "diff_car.xml", base, (0, 0, 0)))
+        robots.append(_robot("car", "diff_car.xml", base, (0, 0, 0.045)))
     return _base_world(f"empty_{kind}", [], robots)
 
 

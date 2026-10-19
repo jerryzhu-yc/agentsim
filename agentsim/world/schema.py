@@ -19,6 +19,9 @@ from agentsim.errors import WorldError
 _GEOM_ARITY = {"box": 3, "sphere": 1, "cylinder": 2}
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _TIMEOUT_POLICIES = {"last_ctrl", "pause"}
+# 积分器名 -> mjtIntegrator 枚举值；implicitfast 是 MuJoCo 官方推荐的
+# 稳定默认（比 Euler 略慢），高刚度接触模型（solref 0.004 量级）必须用它
+_INTEGRATORS = {"euler": 0, "rk4": 1, "implicit": 2, "implicitfast": 3}
 # 传感器类型 -> 挂点要求：joint 系只引用关节，body 系只引用 body
 _SENSOR_TYPES = {"encoder", "imu", "tactile", "joint_torque", "camera"}
 _JOINT_SENSORS = {"encoder", "joint_torque"}
@@ -82,6 +85,8 @@ class RobotSpec:
     name: str
     model: str                      # MJCF 路径（相对世界文件）
     pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    quat: tuple[float, float, float, float] | None = None   # root 绝对朝向
+                                    # （wxyz；模型自带 quat 被清零吸收进此处）
     controller: str | None = None   # 控制器脚本路径（相对世界文件）
     args: dict = field(default_factory=dict)
     sensors: list[SensorSpec] = field(default_factory=list)
@@ -150,6 +155,15 @@ class WorldSpec:
     timestep: float = 0.002
     ctrl_period: int = 32
     gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
+    impratio: float = 1.0         # 接触求解摩擦/法向刚度比：大质量机器人
+                                  # （spot 30kg/anymal 50kg）需要 50-100，
+                                  # 否则 pyramidal 锥下摩擦误差被质量放大
+                                  # （attach 时 world 值优先于模型原值）
+    integrator: int = 0           # 积分器（0=euler 1=rk4 2=implicit
+                                  # 3=implicitfast）：超硬接触模型（如 spot
+                                  # solref=0.004）被 Euler 显式积分会数值
+                                  # 震荡弹跳，必须 implicit 系（attach 时
+                                  # world 值优先于模型原值）
     scene: SceneSpec = field(default_factory=SceneSpec)
     robots: list[RobotSpec] = field(default_factory=list)
     task: TaskSpec = field(default_factory=TaskSpec)
@@ -306,6 +320,9 @@ def _parse_robots(d, path: str, seen: dict) -> list[RobotSpec]:
         _name_unique(name, seen, f"{p}.name")
         model = _str(_req(rd, "model", p), f"{p}.model")
         pos = _vec(rd.get("pos", [0, 0, 0]), 3, f"{p}.pos")
+        quat = rd.get("quat")
+        if quat is not None:
+            quat = _vec(quat, 4, f"{p}.quat")
         controller = rd.get("controller")
         if controller is not None:
             controller = _str(controller, f"{p}.controller")
@@ -313,7 +330,7 @@ def _parse_robots(d, path: str, seen: dict) -> list[RobotSpec]:
         if not isinstance(args, dict):
             raise _err(f"{p}.args", f"需要字典，实际是: {args!r}")
         sensors = _parse_sensors(rd, p)
-        robots.append(RobotSpec(name=name, model=model, pos=pos,
+        robots.append(RobotSpec(name=name, model=model, pos=pos, quat=quat,
                                 controller=controller, args=args, sensors=sensors))
     return robots
 
@@ -404,6 +421,14 @@ def parse_world(d: dict, path: str = "world") -> WorldSpec:
     if ctrl_period < 1:
         raise _err(f"{path}.ctrl_period", f"必须为 >=1 的整数，实际是: {ctrl_period}")
     gravity = _vec(d.get("gravity", [0, 0, -9.81]), 3, f"{path}.gravity")
+    impratio = _num(d.get("impratio", 1.0), f"{path}.impratio")
+    if impratio <= 0:
+        raise _err(f"{path}.impratio", f"必须为正数，实际是: {impratio}")
+    integ_name = str(d.get("integrator", "euler")).lower()
+    if integ_name not in _INTEGRATORS:
+        raise _err(f"{path}.integrator",
+                   f"必须是 {sorted(_INTEGRATORS)} 之一，实际是: {d.get('integrator')!r}")
+    integrator = _INTEGRATORS[integ_name]
 
     scene = _parse_scene(d.get("scene", {}), f"{path}.scene")
     seen: dict[str, str] = {}
@@ -433,8 +458,8 @@ def parse_world(d: dict, path: str = "world") -> WorldSpec:
                            f"引用的 body '{ref}' 不存在，可用名字: {sorted(known)}")
 
     return WorldSpec(name=name, timestep=timestep, ctrl_period=ctrl_period,
-                     gravity=gravity, scene=scene, robots=robots,
-                     task=task, runtime=runtime)
+                     gravity=gravity, impratio=impratio, integrator=integrator,
+                     scene=scene, robots=robots, task=task, runtime=runtime)
 
 
 def load_world(yaml_path: str | pathlib.Path) -> WorldSpec:

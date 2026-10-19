@@ -22,7 +22,7 @@ def _world_dict(controller: str | None, **runtime) -> dict:
         "scene": {"objects": [
             {"name": "cube", "type": "box", "size": [0.05, 0.05, 0.05],
              "pos": [0.3, 0, 0.051], "mass": 0.1, "color": "#F59E0B"}]},
-        "robots": [{"name": "arm", "model": ARM_MODEL,
+        "robots": [{"name": "arm", "model": ARM_MODEL, "pos": [0, 0, 0.05],
                     "controller": controller}],
         "runtime": runtime or {"controller_timeout": 100.0},
     }

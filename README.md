@@ -155,7 +155,7 @@ scene:
 robots:
   - name: arm
     model: ../models/demo_arm.xml   # MJCF 路径（相对本文件）
-    pos: [0, 0, 0]
+    pos: [0, 0, 0.05]               # root 绝对位姿（模型自带 pos 被吸收）
     controller: ../controllers/pick_place.py   # 控制器脚本（相对本文件）
     sensors:                         # 可选：五类传感器，编译进 MuJoCo
       - {name: j1_enc, type: encoder, joint: j1}          # 关节位置
@@ -253,16 +253,81 @@ tools.run(ticks=200)
 
 > 已知语义：attach 时子模型的 MuJoCo option（impratio / cone 等）被父世界值覆盖——接触求解参数以世界 YAML 为准（`worlds/zoo` 生成模板已按各模型类目调好 floor 摩擦）。
 
+## 桌面 GUI 智能工作台（M5）
+
+GUI（`python -m agentsim gui`）从可视化扩展为完整的机器人编程工作台——左右四块面板（场景树/属性/代码/Agent），配合模型库的运动演示与位姿编辑，覆盖"打开/写代码/调位姿/跑/让 AI 来"全闭环。
+
+### 1. 运动演示一键播放
+
+模型库窗口选中任意机器人 → "生成演示并运行"按钮，自动生成内置运动演示并加载世界 → 自动 Run。13 个模型全部预配置运动（见 `agentsim/zoo.py`）：
+
+- **四足小跑（trot）**：Unitree Go1 / Go2、ANYmal C、Boston Dynamics Spot——按对角腿相位（FL-RR / FR-RL）交替摆动；CPG 控制律 `freq`/`amp`/`lag` 在 `zoo.py` 顶部 `_trot` 工厂生成，落地即稳定行走
+- **机械臂扫掠**：Franka Panda / UR5e / xArm7——7 关节正弦相位机，base 绕 z 旋转 + 末端周期摆动
+- **人形摆臂**：Unitree H1 / G1——髋膝肩肘相位差摆动模拟踏步
+- **差速车**：两轮差速车走蛇形前进
+- **静止**：Shadow Hand / ALOHA / Google Robot / Stretch 3——多指/双臂姿态展示
+
+> 四足稳定行走的根因：MuJoCo `attach` 时父世界（默认 Euler 积分器）的 option 会覆盖子模型原值——Spot 原生 `solref=0.004 1` 超硬接触用 `implicitfast`，被 Euler 覆盖后"硬接触+显式积分"会数值震荡弹跳。`WorldSpec` 已加 `integrator` 字段，四足 demo 世界统一设 `implicitfast`。详见 `zoo.py` 中各模型的根因注释。
+
+### 2. 机器人位姿编辑（属性面板）
+
+在场景树选中机器人节点 → 右侧"属性"面板出现位姿组：3 个 xyz 双精度 SpinBox（步进 0.01m，范围 ±20m）+ 3 个 roll/pitch/yaw 角度框（步进 5°，范围 ±360°）→ "应用位姿"按钮：
+
+- 欧拉角与四元数双向转换（`panels.quat_to_euler` / `euler_to_quat`，ZYX 内旋序）
+- 单位朝向（1,0,0,0）时 YAML 里 `quat` 字段省略（不写就是默认）
+- 应用流程：UI → `read_world` MCP 工具拿当前 YAML → 改 `pos`/`quat` 字段 → `load_world` 重载 → 自动重选该机器人节点
+
+机器人模型自带 root body 的 pos/quat 会被 `build_world._attach_robot` 清零——`spec.pos`/`spec.quat` 就是机器人 root 的**绝对世界位姿**。例如 `demo_arm.xml` 的 base 自带 0.05m 高度，世界 YAML 里要写 `pos: [0, 0, 0.05]`（吸收内部偏移）。
+
+### 3. GUI 内置代码编辑器（代码页）
+
+GUI 右侧第四个 tab"代码"：一个 Python 语法高亮编辑器（`PyHighlighter`——QSyntaxHighlighter 零依赖近似实现，字符串/注释/关键字/数字四类着色），下拉选当前世界的机器人 → 加载其控制器文件全文 → 编辑 → "保存并运行"按钮或 `Ctrl+S` 快捷键：
+
+- 保存路径：世界 YAML `base_dir` + 机器人 `controller` 字段
+- 保存后流程：写文件 → `read_world` 重载世界 → 自动 Run（`_pending_run` 状态标记 + 重载完成后 `if self.state.can("run"): self._do_run(...)`）
+- 没绑控制器的机器人显示"没有绑定控制器"提示
+
+可以同时打开任意编辑器改 `.py` 后回到 GUI 点 Run——GUI 内编辑只是更顺手。
+
+### 4. Agent 控制台（Agent 页）
+
+GUI 右侧第五个 tab"Agent"：聊天式下达任务给 AI（OpenAI 兼容 chat/completions API，支持本地 Ollama / OpenAI / DeepSeek / 智谱等任何 OpenAI 兼容服务）。点"配置"填三项：
+
+- `base_url`：例如 `https://api.openai.com/v1` 或 `http://localhost:11434/v1`
+- `api_key`：本地服务可空（Ollama），公开服务必填；密码模式输入
+- `model`：例如 `gpt-4o-mini`、`deepseek-chat`、`glm-4`
+
+配置保存到 `~/.agentsim/agent.json`，`chmod 0600` 保护 api_key。配好后聊天下达任务（Enter 发送，Shift+Enter 换行）：
+
+- Agent 拿到的是 OpenAI function calling 格式工具清单（`bridge.to_openai_tools`）——MCP 的 10 个工具 + 2 个本地文件工具（`write_file`/`read_file`，限定在世界目录内防越界）
+- 工具循环：Agent 返回文本 → 显示在聊天框；返回 tool_calls → MCP 同步等回复（QEventLoop + 30s QTimer 兜底）→ 显示工具调用与结果 → 继续下一轮直到 Agent 不再调工具
+- 系统提示词包含：身份（机器人仿真助手）、当前世界名、所有工具清单（MCP + 本地）、建议工作流（read_world → load_world → run → get_observation）
+
+让 Agent 干的事例：生成一个抓取场景、写一个控制器让臂推 cube、跑起来看结果——Agent 直接读 MCP 工具结果自循环完成。
+
+### 5. PPO 训练示例
+
+`examples/train_ppo_go2.py`：用 stable-baselines3 PPO 在 Go2 上训练行走策略（demo CPG 已经能让 Go2 走 10m，这里做 RL 微调）。sb3 是可选依赖——不装时脚本会给出 `pip install stable-baselines3` 提示后退出，不在回归路径里。
+
+```bash
+pip install stable-baselines3
+~/python examples/train_ppo_go2.py
+# 200k 步训练，输出 models/ppo_go2.zip
+```
+
+奖励设计：`forward（5× dz_root）+ 高度罚（-3 × |z - 0.30|）+ 能耗正则（-0.01 × Σ a²）+ 跌倒终止（rootz < 0.15）`。世界用 `zoo.generate("unitree_go2")` 生成 + 删 controller（env 直驱）+ 保留 `integrator=implicitfast` / `impratio=100` / `ctrl_period=8`——四足稳定的关键参数。
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -q
-# 141 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 157 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create）/传感器（含 bit 级轨迹守护）/
-#              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI
+#              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI/
+#              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端
 ```
 
-其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。
+其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。M5 新增 13 项测试覆盖 demo 生成（全覆盖 + go2 600 tick 行走 >1m + panda 关节活动度）、quat 链路（attach + 欧拉↔四元数 roundtrip + 属性面板应用）、PyHighlighter 四类着色 + CodePanel 保存信号、Agent 后端（config 0600 + chat_url 兼容 + MCP↔OpenAI 工具转换 + 本地文件越界防护）。
 
 ## 项目结构
 
@@ -272,20 +337,22 @@ agentsim/
 │   ├── kernel/sim.py      # 仿真内核：ZMQ ROUTER + 栅栏同步推进
 │   ├── kernel/task.py    # 任务评估 + 观测组装纯函数（内核与 RL env 共用）
 │   ├── rl_env.py          # gymnasium.Env 包装（RL 训练接口）
-│   ├── zoo.py              # 机器人模型库（Menagerie 13 个预配置模型 + 生成器）
+│   ├── zoo.py              # 机器人模型库（Menagerie 13 个预配置模型 + 运动演示生成器）
 │   ├── controller.py      # 控制器侧 Robot 客户端（用户唯一 API）
-│   ├── world/schema.py    # YAML → dataclass，前置校验
-│   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译
+│   ├── world/schema.py    # YAML → dataclass，前置校验（含 integrator / quat 字段）
+│   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译（attach 时设 integrator）
 │   ├── supervisor.py      # 快照/teleport（逐位可复现）
 │   ├── mcp_server.py      # MCP stdio 服务器（零依赖 JSON-RPC）
 │   ├── render.py          # 离屏渲染 + 手写 PNG 编码（screenshot 实现层）
-│   ├── gui/               # PySide6 桌面 GUI（app / render_view / panels / mcp_client）
+│   ├── agent/             # GUI Agent 控制台后端（config/bridge/local_tools/worker）
+│   ├── gui/               # PySide6 桌面工作台（app/render_view/panels/mcp_client）
 │   ├── scene_gen.py       # 5 个确定性场景模板
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
-└── tests/                 # 141 项测试
+├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
+└── tests/                 # 157 项测试（含 M5 运动演示 / 位姿编辑 / 代码编辑器 / Agent）
 ```
 
 ## Roadmap
@@ -296,6 +363,7 @@ agentsim/
 - [x] M3 RL 训练接口 —— `AgentSimEnv`（gymnasium.Env）：YAML 世界即确定性环境，动作/观测/奖励语义与内核一处实现（`kernel/task.py`），同 YAML 两遍轨迹逐位一致
 - [x] M1 心跳机制 —— 控制器 `_recv` 100ms poller 轮询 + `getppid` 孤儿检测：内核进程一死控制器必被 init/subreaper 收养（父 pid 变化），随即 `RuntimeError("内核已退出")` 退出；思考时间无限等待语义不变
 - [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（13 个预配置著名机器人），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
+- [x] M5 运动演示与智能工作台 —— 13 个模型一键运动演示（四足 trot / 机械臂扫掠 / 人形摆臂）+ GUI 位姿编辑面板（xyz+欧拉角）+ 内置 Python 代码编辑器（保存并运行）+ Agent 控制台（OpenAI 兼容 chat API 调用，AI 直接生成场景/写代码/运行验证）+ PPO 训练示例（`examples/train_ppo_go2.py`）
 
 ## 已知取舍（M0）
 

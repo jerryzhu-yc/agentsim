@@ -11,31 +11,53 @@ import numpy as np
 
 from agentsim.world.builder import ResolvedTask, RobotIndex
 
-# 关节类型 -> qpos/qvel 占用宽度（hinge/slide 等默认 1）
+# 关节类型 -> qpos/qvel 占用宽度（hinge/slide 等默认 1）。
+# qvel 宽度与 qpos 不同：free 关节 qpos 7（位置3+四元数4）但 qvel 6（角速度3+线速度3），
+# ball 关节 qpos 4（四元数）但 qvel 3（角速度）——此前共用一张表会让带命名
+# 自由关节的机器人（spot/g1 等）观测 qvel 错位一位。
 _QPOS_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): 7,
                int(mujoco.mjtJoint.mjJNT_BALL): 4}
+_QVEL_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): 6,
+               int(mujoco.mjtJoint.mjJNT_BALL): 3}
+
+
+def obs_layout(model: mujoco.MjModel, ridx: RobotIndex) -> dict[str, tuple[int, int, int]]:
+    """观测拼接布局：{关节名: (qpos 偏移, qvel 偏移, qpos 宽度)}。
+
+    robot_obs 按此布局拼接；zoo demo 生成器注入控制器用的偏移也取自这里——
+    一份布局，两个消费方，杜绝错位。
+    """
+    qp = qv = 0
+    out = {}
+    for jname, jid in ridx.joints.items():
+        w = _QPOS_WIDTH.get(int(model.jnt_type[jid]), 1)
+        out[jname] = (qp, qv, w)
+        qp += w
+        qv += _QVEL_WIDTH.get(int(model.jnt_type[jid]), 1)
+    return out
 
 
 def joint_width(model: mujoco.MjModel, ridx: RobotIndex) -> tuple[int, int]:
     """单机器人 qpos/qvel 拼接宽度（观测空间构造用）。"""
     qpos_w = qvel_w = 0
     for jid in ridx.joints.values():
-        w = _QPOS_WIDTH.get(int(model.jnt_type[jid]), 1)
-        qpos_w += w
-        qvel_w += w
+        qpos_w += _QPOS_WIDTH.get(int(model.jnt_type[jid]), 1)
+        qvel_w += _QVEL_WIDTH.get(int(model.jnt_type[jid]), 1)
     return qpos_w, qvel_w
 
 
 def robot_obs(ridx: RobotIndex, model: mujoco.MjModel,
               data: mujoco.MjData) -> tuple[list[float], list[float]]:
     """单机器人 qpos/qvel（按 RobotIndex.joints 声明顺序拼接）。"""
+    lay = obs_layout(model, ridx)
     qpos, qvel = [], []
-    for jid in ridx.joints.values():
-        w = _QPOS_WIDTH.get(int(model.jnt_type[jid]), 1)
+    for jname, jid in ridx.joints.items():
+        w = lay[jname][2]
+        vw = _QVEL_WIDTH.get(int(model.jnt_type[jid]), 1)
         adr = model.jnt_qposadr[jid]
         qpos += list(map(float, data.qpos[adr:adr + w]))
         vadr = model.jnt_dofadr[jid]
-        qvel += list(map(float, data.qvel[vadr:vadr + w]))
+        qvel += list(map(float, data.qvel[vadr:vadr + vw]))
     return qpos, qvel
 
 

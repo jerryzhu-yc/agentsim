@@ -19,6 +19,8 @@ def main(argv=None) -> int:
     from agentsim.gui.app import MainWindow
 
     app = QApplication(argv if argv is not None else sys.argv)
+    from agentsim.gui import theme
+    app.setStyleSheet(theme.APP_QSS)
     win = MainWindow()
     win.show()
     return app.exec()

@@ -27,7 +27,7 @@ G = "[-0.04*(t%6), 0.02*(t%5), 0.03*(t%4), -0.008*(t%3), 0.008*(t%3)]"
 def _world(controller: str | None = None, with_robot: bool = True) -> dict:
     robots = []
     if with_robot:
-        robots.append({"name": "a", "model": ARM_MODEL,
+        robots.append({"name": "a", "model": ARM_MODEL, "pos": [0, 0, 0.05],
                        "controller": controller})
     return {
         "name": "supervisor_test",

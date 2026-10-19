@@ -24,12 +24,12 @@ scene:
 robots:
   - name: arm_a
     model: ../models/demo_arm.xml
-    pos: [0, 0, 0]
+    pos: [0, 0, 0.05]
     controller: ../controllers/random_arm.py
     args: {speed: 0.15}
   - name: arm_b
     model: ../models/demo_arm.xml
-    pos: [0.6, 0, 0]
+    pos: [0.6, 0, 0.05]
     controller: ../controllers/random_arm.py
     args: {speed: 0.3}
 

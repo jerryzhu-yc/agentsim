@@ -35,7 +35,7 @@ def _arm_world(sensors):
         ]},
         "robots": [{
             "name": "arm", "model": "../models/demo_arm.xml",
-            "pos": [0.35, 0.15, 0.1], "sensors": sensors,
+            "pos": [0.35, 0.15, 0.15], "sensors": sensors,
         }],
     }
 

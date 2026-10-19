@@ -227,6 +227,28 @@ def _add_child_sensors(robot: RobotSpec, child: mujoco.MjSpec) -> None:
             _find_body(s).add_camera(**kwargs)
 
 
+def _ensure_actuator_names(child: mujoco.MjSpec) -> list[str]:
+    """给无名执行器补名（google_robot 等模型的 <position joint=.../> 不写 name）。
+
+    名字取传输目标（关节名），冲突按 actuatorN 兜底。attach 前执行——
+    名字随前缀存活，索引与 hello 清单才引用得到。返回全部执行器名
+    （与 attach 后的前缀名一一对应，去掉前缀即这里的名字）。
+    """
+    taken = {a.name for a in child.actuators if a.name}
+    names = []
+    for i, a in enumerate(child.actuators):
+        if not a.name:
+            base = a.target or f"actuator{i}"
+            name, k = base, 1
+            while name in taken:
+                name = f"{base}_{k}"
+                k += 1
+            a.name = name
+            taken.add(name)
+        names.append(a.name)
+    return names
+
+
 def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
     model_path = _resolve_path(spec.base_dir, robot.model, "机器人模型")
     try:
@@ -235,7 +257,17 @@ def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
         raise WorldError(f"机器人 '{robot.name}' 模型解析失败 ({model_path}): {e}") from e
 
     _add_child_sensors(robot, child)
-    frame = mj.worldbody.add_frame(name=f"{robot.name}_frame", pos=list(robot.pos))
+    _ensure_actuator_names(child)          # 无名执行器补名（attach 前改名才存活）
+    # root body 自带 pos/quat 清零：spec.pos/quat 必须是机器人 root 的绝对世界
+    # 位姿，否则 menagerie 四足（trunk 自带 0.445 高度）会被叠加出生到 0.9m
+    # 高空——GUI 拖动回写位姿也因此不幂等
+    for b in child.bodies:
+        if b.parent is child.worldbody:
+            b.pos[:] = [0.0, 0.0, 0.0]
+            b.quat[:] = [1.0, 0.0, 0.0, 0.0]
+    frame = mj.worldbody.add_frame(
+        name=f"{robot.name}_frame", pos=list(robot.pos),
+        quat=list(robot.quat) if robot.quat else None)
     try:
         mj.attach(child, prefix=f"{robot.name}/", frame=frame)
     except Exception as e:
@@ -307,13 +339,16 @@ def _build_index(model: mujoco.MjModel, spec: WorldSpec) -> NameIndex:
 
 
 def _child_actuator_names(spec: WorldSpec, rd: RobotSpec) -> list[str]:
-    """从机器人的 MJCF 里读取执行器原始名（无前缀），供索引解析。"""
+    """从机器人的 MJCF 里读取执行器原始名（无前缀），供索引解析。
+
+    与 _attach_robot 同一套补名逻辑（确定性一致），无名执行器不会丢。
+    """
     model_path = _resolve_path(spec.base_dir, rd.model, "机器人模型")
     child = mujoco.MjSpec.from_file(str(model_path))
-    names = [a.name for a in child.actuators if a.name]
+    names = _ensure_actuator_names(child)
     if not names:
         raise WorldError(
-            f"机器人 '{rd.name}' 模型里没有任何命名的执行器 ({model_path})，"
+            f"机器人 '{rd.name}' 模型里没有任何执行器 ({model_path})，"
             f"无法建立设备索引")
     return names
 
@@ -331,6 +366,13 @@ def build_world(spec: WorldSpec) -> tuple[mujoco.MjModel, NameIndex]:
     mj.modelname = spec.name
     mj.option.timestep = spec.timestep
     mj.option.gravity = list(spec.gravity)
+    # attach 时 parent（世界）的 option 优先：大质量机器人需要高
+    # impratio（如 spot/anymal 50-100），在此设置才会覆盖模型原值
+    mj.option.impratio = spec.impratio
+    # 积分器同理被 attach 覆盖：menagerie 高刚度模型（spot 的 solref=0.004）
+    # 原生用 implicitfast，被世界默认 Euler 覆盖后"硬接触 + 显式积分"会
+    # 数值震荡弹跳（躯干周期性跳起、关节跟踪却良好的根因）
+    mj.option.integrator = spec.integrator
     # 离屏帧缓冲调大：GUI 渲染视口可达 ~1600px，默认 640 会抛异常
     mj.visual.global_.offwidth = 1920
     mj.visual.global_.offheight = 1440

@@ -107,7 +107,7 @@ class TestTaskResolution:
 
 class TestRobotPlacement:
     def test_attach_pos(self, built):
-        """pick_cube 里 arm 放在原点，base 应在 (0,0,0.05)"""
+        """pos = root 绝对位姿（模型自带 pos 被清零吸收进 spec.pos）"""
         _, model, _ = built
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
@@ -122,13 +122,36 @@ class TestRobotPlacement:
                  "pos": [0, 0, 0.05]}]},
             "robots": [{"name": "r1",
                         "model": str(ROOT / "models" / "demo_arm.xml"),
-                        "pos": [0.5, 0.25, 0]}],
+                        "pos": [0.5, 0.25, 0.05]}],
         }
         spec = parse_world(d)
         model, index = build_world(spec)
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
         assert np.allclose(data.body("r1/base").xpos, [0.5, 0.25, 0.05])
+
+    def test_attach_quat(self):
+        """P2/T4：robot.quat（wxyz）传到 root——绕 z +90° 后 R 首行翻转"""
+        d = {
+            "name": "quaternion",
+            "robots": [{"name": "r1",
+                        "model": str(ROOT / "models" / "demo_arm.xml"),
+                        "pos": [0, 0, 0.05],
+                        "quat": [0.7071068, 0, 0, 0.7071068]}],
+        }
+        spec = parse_world(d)
+        model, index = build_world(spec)
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        b = data.body("r1/base")
+        assert np.allclose(b.xquat, [0.7071068, 0, 0, 0.7071068], atol=1e-3)
+        assert np.allclose(b.xmat[:3], [0, -1, 0], atol=1e-3)   # R_z(90°) 首行
+        # 默认 None：不写 quat 保持单位朝向
+        d["robots"][0].pop("quat")
+        model2, _ = build_world(parse_world(d))
+        data2 = mujoco.MjData(model2)
+        mujoco.mj_forward(model2, data2)
+        assert np.allclose(data2.body("r1/base").xquat, [1, 0, 0, 0], atol=1e-6)
 
 
 class TestSmoke:
@@ -151,9 +174,9 @@ class TestSmoke:
                  "pos": [0, 0, 0.05]}]},
             "robots": [
                 {"name": "a", "model": str(ROOT / "models" / "demo_arm.xml"),
-                 "pos": [0, 0, 0]},
+                 "pos": [0, 0, 0.05]},
                 {"name": "b", "model": str(ROOT / "models" / "demo_arm.xml"),
-                 "pos": [0.6, 0, 0]},
+                 "pos": [0.6, 0, 0.05]},
             ],
         }
         spec = parse_world(d)

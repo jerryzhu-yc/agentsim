@@ -110,3 +110,88 @@ def test_zoo_dialog_offscreen(qapp):
         assert dlg.selected_key        # 任一 key 可取即 UI 链路通
     finally:
         dlg.deleteLater()
+
+
+# ================================================================ M5-P1 运动演示
+
+def test_demo_config_full_coverage():
+    """T1：13 模型全部带 demo 配置，kind/字段完整（纯离线，零缓存依赖）。"""
+    from agentsim.zoo import MODELS
+    assert len(MODELS) == 13
+    assert all(m.get("demo") for m in MODELS.values())
+    kinds = {m["demo"]["kind"] for m in MODELS.values()}
+    assert kinds <= {"trot", "osc", "balance"}
+    # 四足全走 trot 且控制要素齐备；其余走 osc/balance
+    quads = [m for m in MODELS.values() if m["cat"] == "四足"]
+    assert len(quads) == 4
+    for m in quads:
+        d = m["demo"]
+        assert d["kind"] == "trot"
+        assert len(d["legs"]) == 4 and len(d["kinds"]) == 3
+        for f in ("home", "amp", "freq", "settle", "ramp", "lag"):
+            assert d[f] or d[f] == 0.0, (m["title"], f)
+
+
+def test_demo_generate_products(tmp_path):
+    """T2 前置：demo=True 产物完整——demo.py/世界隐含 demo 引擎参数。"""
+    import yaml
+    from agentsim.zoo import generate
+    r = generate("unitree_go2", out_dir=tmp_path / "g", demo=True)
+    assert "demo" in r and pathlib.Path(r["demo"]).exists()
+    world_p = pathlib.Path(r["world"])
+    with open(world_p, encoding="utf-8") as f:
+        doc = yaml.safe_load(f)
+    # 高摩擦刚度 + implicitfast：硬接触模型（spot solref=0.004）被 Euler
+    # 覆盖会数值震荡弹跳——demo 世界的隐含引擎参数（attach 时优先）
+    assert doc["impratio"] == 100
+    assert doc["integrator"] == "implicitfast"
+    assert doc["ctrl_period"] == 8          # demo 控制周期加密
+    text = pathlib.Path(r["demo"]).read_text(encoding="utf-8")
+    assert "robot.set(" in text and "robot.step()" in text
+    assert "FL_hip" in text                 # 执行器清单已注入
+
+
+def test_demo_go2_walks_end_to_end(tmp_path):
+    """T2：go2 demo 端到端 600 tick 零 crash 且位移 > 1m（真实 ZMQ 全链路）。"""
+    import math
+    from agentsim.zoo import generate
+    from agentsim.mcp_server import AgentSimSession
+    r = generate("unitree_go2", out_dir=tmp_path / "g", demo=True)
+    s = AgentSimSession()
+    try:
+        s.call_tool("load_world", {"yaml_path": r["world"]})
+        obs0 = s.call_tool("get_observation", {})
+        stats = s.call_tool("run", {"ticks": 600})
+        assert stats["ticks"] == 600 and stats["crashed"] == []
+        obs = s.call_tool("get_observation", {})
+        rob0, rob1 = obs0["robots"]["unitree_go2"], obs["robots"]["unitree_go2"]
+        root = next(iter(rob1["bodies"]))
+        p0 = rob0["bodies"][next(iter(rob0["bodies"]))]
+        p1 = rob1["bodies"][root]
+        dxy = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        assert dxy > 1.0, f"位移 {dxy:.2f}m 未过 1m 门槛"
+        assert p1[2] > 0.15, f"rootz {p1[2]:.2f} 趴地"
+    finally:
+        s.close()
+
+
+@pytest.mark.skipif(not _cached("franka_emika_panda", "panda.xml"),
+                    reason="panda 未缓存（首次使用需网络下载）")
+def test_demo_panda_moves(tmp_path):
+    """T3：panda demo 零 crash 且关节动（观测变化 > 0.1 rad）。"""
+    from agentsim.zoo import generate
+    from agentsim.mcp_server import AgentSimSession
+    r = generate("franka_emika_panda", out_dir=tmp_path / "p", demo=True)
+    s = AgentSimSession()
+    try:
+        s.call_tool("load_world", {"yaml_path": r["world"]})
+        obs0 = s.call_tool("get_observation", {})
+        stats = s.call_tool("run", {"ticks": 200})
+        assert stats["ticks"] == 200 and stats["crashed"] == []
+        obs = s.call_tool("get_observation", {})
+        q0 = obs0["robots"]["franka_emika_panda"]["qpos"]
+        q1 = obs["robots"]["franka_emika_panda"]["qpos"]
+        dq = max(abs(a - b) for a, b in zip(q0, q1))
+        assert dq > 0.1, f"关节最大变化 {dq:.3f} rad，未在运动"
+    finally:
+        s.close()

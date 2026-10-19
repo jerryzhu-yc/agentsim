@@ -25,7 +25,9 @@ scene:
 robots:
   - name: arm
     model: ../models/demo_arm.xml
-    pos: [0, 0, 0]
+    # pos = root 绝对位姿（builder 会清零模型自带 pos）：demo_arm base
+    # 自带 0.05 高，吸收进 pos 保持原标定——pick_place 按此高度侧扫
+    pos: [0, 0, 0.05]
     controller: ../controllers/pick_place.py   # 侧扫推式相位机
 
 task:

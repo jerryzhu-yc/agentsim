@@ -1,12 +1,479 @@
-"""右侧面板控件：世界信息 / 任务状态 / 观测树。"""
+"""Webots 风格的停靠面板集合。
+
+- SceneTreePanel  场景树（世界 / 机器人 / 物体层级，选中节点 -> 属性面板）
+- PropertiesPanel 属性（选中节点详情 + 任务统计常驻底部）
+- ObsPanel        观测树（保留 M1 接口，测试依赖；标签页方式呈现）
+- ConsolePanel    控制台（GUI 事件 + 后端 stderr）
+- WorldPanel      世界概要（兼容旧接口）
+- TaskPanel       任务状态大字（兼容旧接口）
+"""
 from __future__ import annotations
 
-from PySide6.QtWidgets import (QFormLayout, QGroupBox, QLabel, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+import datetime as _dt
+import math
+import pathlib
 
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import (QColor, QFont, QKeySequence, QShortcut,
+                           QSyntaxHighlighter, QTextCharFormat, QTextCursor)
+from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QPushButton,
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                               QWidget)
+
+from agentsim.gui import theme
+
+# 场景树 ItemDataRole：存 ("robot"|"object"|"world", 标识名)
+_NODE_KIND = Qt.ItemDataRole.UserRole + 1
+
+
+def _fmt_vec(v, nd=3) -> str:
+    try:
+        return "(" + ", ".join(f"{float(x):+.{nd}f}" for x in v) + ")"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def quat_to_euler(q) -> tuple[float, float, float]:
+    """wxyz 四元数 -> (roll, pitch, yaw) 度（ZYX 内旋序）。属性面板用。"""
+    w, x, y, z = (float(v) for v in q)
+    roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
+
+
+def euler_to_quat(roll: float, pitch: float, yaw: float) -> tuple[float, ...]:
+    """(roll, pitch, yaw) 度 -> wxyz 四元数（与 quat_to_euler 互逆）。"""
+    cr, sr = math.cos(math.radians(roll) / 2), math.sin(math.radians(roll) / 2)
+    cp, sp = math.cos(math.radians(pitch) / 2), math.sin(math.radians(pitch) / 2)
+    cy, sy = math.cos(math.radians(yaw) / 2), math.sin(math.radians(yaw) / 2)
+    return (cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy)
+
+
+# ================================================================ 场景树
+
+class SceneTreePanel(QWidget):
+    """左侧场景树：加载世界后展示 世界/机器人(关节)/物体 层级。
+
+    nodeSelected(kind:str, name:str, payload)：选中节点时发出，供属性面板显示。
+    """
+
+    nodeSelected = Signal(str, str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        bar = QHBoxLayout()
+        self._title = QLabel("场景结构")
+        self._title.setStyleSheet(f"color:{theme.C_TEXT_DIM}; font-weight:600;")
+        bar.addWidget(self._title)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["名称", "类型"])
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setRootIsDecorated(True)
+        self._tree.header().setSectionResizeMode(
+            0, self._tree.header().ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(
+            1, self._tree.header().ResizeMode.ResizeToContents)
+        lay.addWidget(self._tree, stretch=1)
+        self._tree.itemSelectionChanged.connect(self._on_select)
+
+        self._spec = None
+        self.set_world(None)
+
+    def set_world(self, spec) -> None:
+        self._spec = spec
+        self._tree.clear()
+        if spec is None:
+            empty = QTreeWidgetItem(["（未加载世界）", ""])
+            empty.setDisabled(True)
+            self._tree.addTopLevelItem(empty)
+            return
+
+        root = QTreeWidgetItem([spec.name, "世界"])
+        root.setData(0, _NODE_KIND, ("world", spec.name, spec))
+        self._tree.addTopLevelItem(root)
+
+        rob_root = QTreeWidgetItem(["机器人", f"{len(spec.robots)} 个"])
+        root.addChild(rob_root)
+        for rd in spec.robots:
+            rnode = QTreeWidgetItem([rd.name, rd.model.split("/")[-1]])
+            rnode.setData(0, _NODE_KIND, ("robot", rd.name, rd))
+            rob_root.addChild(rnode)
+            for six in rd.sensors:
+                sn = QTreeWidgetItem([six.name, six.type])
+                sn.setData(0, _NODE_KIND, ("sensor", f"{rd.name}/{six.name}", six))
+                rnode.addChild(sn)
+
+        obj_root = QTreeWidgetItem(["物体", f"{len(spec.scene.objects)} 个"])
+        root.addChild(obj_root)
+        for od in spec.scene.objects:
+            onode = QTreeWidgetItem([od.name,
+                                     od.type + ("（固定）" if od.static else "")])
+            onode.setData(0, _NODE_KIND, ("object", od.name, od))
+            obj_root.addChild(onode)
+
+        self._tree.expandAll()
+        self._tree.setCurrentItem(root)
+
+    def select_node(self, kind: str, name: str) -> bool:
+        """3D 视口点击联动：程序选中对应节点（触发 nodeSelected 联动属性面板）。"""
+        def walk(item) -> bool:
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                d = ch.data(0, _NODE_KIND)
+                if d is not None and d[0] == kind and d[1] == name:
+                    self._tree.scrollToItem(ch)
+                    self._tree.setCurrentItem(ch)
+                    return True
+                if walk(ch):
+                    return True
+            return False
+
+        for i in range(self._tree.topLevelItemCount()):
+            if walk(self._tree.topLevelItem(i)):
+                return True
+        return False
+
+    def _on_select(self) -> None:
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        data = items[0].data(0, _NODE_KIND)
+        if data is None:
+            return
+        kind, name, payload = data
+        self.nodeSelected.emit(kind, name, payload)
+
+
+# ================================================================ 属性面板
+
+class PropertiesPanel(QWidget):
+    """右侧属性：上半部分显示选中节点属性，下半部分常驻任务统计。"""
+
+    poseApplied = Signal(str, list, object)   # robot 名, pos, quat(wxyz|None)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+
+        sel_box = QGroupBox("属性")
+        self._sel_form = QFormLayout(sel_box)
+        self._sel_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._sel_name = QLabel("—")
+        self._sel_name.setStyleSheet("font-weight:600;")
+        self._sel_form.addRow("选中", self._sel_name)
+        self._sel_rows: list[tuple[QLabel, QLabel]] = []
+        outer.addWidget(sel_box, stretch=1)
+
+        # 位姿编辑（机器人节点专用）：xyz + 欧拉角（度）-> 应用写回世界 YAML。
+        # quat 单位朝向时不写（保持 YAML 干净，None 语义）
+        self._pose_box = QGroupBox("位姿")
+        pf = QFormLayout(self._pose_box)
+        self._pos_spins = []
+        for lb, lo, hi in (("x", -20.0, 20.0), ("y", -20.0, 20.0),
+                           ("z", -5.0, 10.0)):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi); s.setDecimals(3); s.setSingleStep(0.01)
+            s.setToolTip(f"世界坐标 {lb}（米）")
+            self._pos_spins.append(s)
+        row_p = QHBoxLayout()
+        for s in self._pos_spins:
+            row_p.addWidget(s)
+        pf.addRow("位置 (m)", row_p)
+        self._rot_spins = []
+        for lb in ("roll", "pitch", "yaw"):
+            s = QDoubleSpinBox()
+            s.setRange(-360.0, 360.0); s.setDecimals(1); s.setSingleStep(5.0)
+            s.setToolTip(f"{lb}（度，ZYX 序）")
+            self._rot_spins.append(s)
+        row_r = QHBoxLayout()
+        for s in self._rot_spins:
+            row_r.addWidget(s)
+        pf.addRow("旋转 (°)", row_r)
+        btn = QPushButton("应用位姿")
+        btn.setToolTip("写入世界 YAML 并重载（World as Code：改文件即改世界）")
+        btn.clicked.connect(self._on_apply_pose)
+        pf.addRow("", btn)
+        self._pose_box.setVisible(False)
+        self._pose_name: str | None = None
+        outer.addWidget(self._pose_box)
+
+        # 任务统计（常驻，Webots 风格的 HUD 数据栏）
+        task_box = QGroupBox("任务状态")
+        tl = QFormLayout(task_box)
+        self._tick = QLabel("-")
+        self._time = QLabel("-")
+        self._success = QLabel("-")
+        self._reward = QLabel("-")
+        for lb in (self._tick, self._time, self._success, self._reward):
+            lb.setStyleSheet("font-size:13pt; font-weight:600;")
+        self._success.setStyleSheet(
+            f"font-size:13pt; font-weight:600; color:{theme.C_TEXT_DIM};")
+        tl.addRow("tick", self._tick)
+        tl.addRow("仿真时间 (s)", self._time)
+        tl.addRow("成功", self._success)
+        tl.addRow("reward", self._reward)
+        outer.addWidget(task_box)
+
+    def _clear_rows(self) -> None:
+        for k, v in self._sel_rows:
+            self._sel_form.removeRow(k)
+        self._sel_rows.clear()
+
+    def _add_row(self, key: str, value: str) -> None:
+        k = QLabel(key)
+        v = QLabel(str(value))
+        v.setWordWrap(True)
+        v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._sel_form.addRow(k, v)
+        self._sel_rows.append((k, v))
+
+    # ------------------------------------------------------------ 节点选择
+
+    def show_node(self, kind: str, name: str, payload) -> None:
+        self._clear_rows()
+        self._sel_name.setText(name)
+        is_robot = kind == "robot"
+        self._pose_box.setVisible(is_robot)
+        if kind == "world":
+            self._add_row("timestep", f"{payload.timestep:g} s")
+            self._add_row("ctrl_period", f"{payload.ctrl_period} 步")
+            self._add_row("重力", _fmt_vec(payload.gravity))
+            floor = payload.scene.floor
+            self._add_row("地面尺寸",
+                          f"{floor.size[0]:g} × {floor.size[1]:g} m")
+            self._add_row("max_ticks",
+                          payload.task.max_ticks if payload.task.max_ticks
+                          else "不限")
+        elif is_robot:
+            self._pose_name = name
+            self._add_row("模型", payload.model)
+            self._add_row("初始位置", _fmt_vec(payload.pos))
+            self._add_row("控制器", payload.controller or "（无）")
+            self._add_row("传感器数", len(payload.sensors))
+            if payload.args:
+                self._add_row("args", ", ".join(f"{k}={v}"
+                                                for k, v in payload.args.items()))
+            # 选中即回填当前值（拖动后 _on_loaded 重选也会走到这里同步）
+            for s, v in zip(self._pos_spins, payload.pos):
+                s.setValue(float(v))
+            eul = quat_to_euler(payload.quat or (1.0, 0.0, 0.0, 0.0))
+            for s, v in zip(self._rot_spins, eul):
+                s.setValue(v)
+        elif kind == "object":
+            self._add_row("类型", payload.type)
+            self._add_row("尺寸(半)", _fmt_vec(payload.size))
+            self._add_row("位置", _fmt_vec(payload.pos))
+            self._add_row("固定", "是" if payload.static else "否")
+            self._add_row("质量", payload.mass if payload.mass is not None else "自动")
+            self._add_row("颜色", payload.color)
+        elif kind == "sensor":
+            self._add_row("类型", payload.type)
+            if payload.joint:
+                self._add_row("挂接关节", payload.joint)
+            if payload.body:
+                self._add_row("挂接 body", payload.body)
+            if payload.radius is not None:
+                self._add_row("半径", f"{payload.radius:g} m")
+
+    def clear_selection(self) -> None:
+        self._clear_rows()
+        self._sel_name.setText("—")
+        self._pose_box.setVisible(False)
+        self._pose_name = None
+
+    def _on_apply_pose(self) -> None:
+        """收集 spin 值 -> poseApplied 信号（app 侧 read_world 写 YAML 重载）。"""
+        if not self._pose_name:
+            return
+        pos = [round(s.value(), 4) for s in self._pos_spins]
+        quat = euler_to_quat(*(s.value() for s in self._rot_spins))
+        quat = [round(v, 6) for v in quat]
+        ident = (1.0, 0.0, 0.0, 0.0)
+        quat = None if all(abs(v - e) < 1e-6
+                           for v, e in zip(quat, ident)) else quat
+        self.poseApplied.emit(self._pose_name, pos, quat)
+
+    # ------------------------------------------------------------ 任务数据
+
+    def update_obs(self, obs: dict) -> None:
+        task = obs.get("task") or {}
+        self._tick.setText(str(obs.get("tick", "-")))
+        self._time.setText(str(obs.get("time", "-")))
+        succ = task.get("success")
+        if succ is None:
+            self._success.setText("-")
+            self._success.setStyleSheet(
+                f"font-size:13pt; font-weight:600; color:{theme.C_TEXT_DIM};")
+        else:
+            self._success.setText("成功" if succ else "未成功")
+            self._success.setStyleSheet(
+                f"font-size:13pt; font-weight:600; color:"
+                f"{theme.C_OK if succ else theme.C_ERR};")
+        self._reward.setText(str(task.get("reward", "-")))
+
+    def update_stats(self, stats: dict) -> None:
+        self._tick.setText(f"{stats.get('ticks', '-')}  (结束)")
+        succ = stats.get("success")
+        if succ is None:
+            self._success.setText("-")
+        else:
+            self._success.setText("成功" if succ else "未成功")
+            self._success.setStyleSheet(
+                f"font-size:13pt; font-weight:600; color:"
+                f"{theme.C_OK if succ else theme.C_ERR};")
+        self._reward.setText(str(stats.get("reward", "-")))
+
+    def reset_task(self) -> None:
+        for lb in (self._tick, self._time, self._reward):
+            lb.setText("-")
+        self._success.setText("-")
+        self._success.setStyleSheet(
+            f"font-size:13pt; font-weight:600; color:{theme.C_TEXT_DIM};")
+
+
+# ================================================================ 观测树（保留 M1 接口）
+
+class ObsPanel(QWidget):
+    """观测树：逐机器人关节 qpos/ctrl + 传感器读数 + 物体 pos/quat。
+
+    保留 self._tree 与 update_obs/clear 接口（tests/test_gui.py 依赖）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        tip = QLabel("关节角 q / 控制量 u（实时）")
+        tip.setStyleSheet(f"color:{theme.C_TEXT_DIM};")
+        lay.addWidget(tip)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["名称", "值"])
+        self._tree.setAlternatingRowColors(True)
+        self._tree.header().setSectionResizeMode(
+            0, self._tree.header().ResizeMode.ResizeToContents)
+        self._tree.header().setSectionResizeMode(
+            1, self._tree.header().ResizeMode.Stretch)
+        lay.addWidget(self._tree)
+
+    def update_obs(self, obs: dict) -> None:
+        # 记录当前展开状态，刷新后保持（避免每帧折叠抖动）
+        expanded = {self._tree.topLevelItem(i).text(0)
+                    for i in range(self._tree.topLevelItemCount())
+                    if self._tree.topLevelItem(i).isExpanded()}
+
+        self._tree.clear()
+        for rname, robs in (obs.get("robots") or {}).items():
+            top = QTreeWidgetItem([rname])
+            names = robs.get("joint_names") or []
+            qpos = robs.get("qpos") or []
+            ctrl = robs.get("ctrl") or []
+            for i, jn in enumerate(names):
+                v = f"q={qpos[i]:+.3f}" if i < len(qpos) else ""
+                if i < len(ctrl):
+                    v += f"   u={ctrl[i]:+.3f}"
+                QTreeWidgetItem(top, [jn, v])
+            sensors = robs.get("sensors") or {}
+            if sensors:                        # M2：有传感器才有该键
+                st = QTreeWidgetItem(top, ["sensors"])
+                for sn, sv in sensors.items():
+                    if isinstance(sv, list):
+                        sv = "(" + ", ".join(f"{x:+.3f}" for x in sv) + ")"
+                    else:
+                        sv = f"{sv:+.3f}"
+                    QTreeWidgetItem(st, [sn, sv])
+            self._tree.addTopLevelItem(top)
+            top.setExpanded(rname in expanded or not expanded)
+        for oname, oinfo in (obs.get("objects") or {}).items():
+            pos = oinfo.get("pos") or []
+            quat = oinfo.get("quat") or []
+            top = QTreeWidgetItem([
+                oname,
+                f"pos=({', '.join(f'{x:+.2f}' for x in pos)}) "
+                f"quat=({', '.join(f'{x:+.2f}' for x in quat)})"])
+            self._tree.addTopLevelItem(top)
+
+    def clear(self) -> None:
+        self._tree.clear()
+
+
+# ================================================================ 控制台
+
+class ConsolePanel(QWidget):
+    """控制台：带级别着色 + 时间戳 + 清空按钮。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        bar = QHBoxLayout()
+        hint = QLabel("控制台")
+        hint.setStyleSheet(f"color:{theme.C_TEXT_DIM}; font-weight:600;")
+        bar.addWidget(hint)
+        bar.addStretch(1)
+        btn_clear = QPushButton("清空")
+        btn_clear.setFlat(True)
+        btn_clear.clicked.connect(self.clear)
+        bar.addWidget(btn_clear)
+        lay.addLayout(bar)
+
+        self._edit = QPlainTextEdit()
+        self._edit.setObjectName("console")
+        self._edit.setReadOnly(True)
+        self._edit.setMaximumBlockCount(5000)
+        lay.addWidget(self._edit)
+
+    def _write(self, text: str, color: str, source: str = "") -> None:
+        ts = _dt.datetime.now().strftime("%H:%M:%S")
+        cursor = self._edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        prefix_fmt = QTextCharFormat()
+        prefix_fmt.setForeground(QColor(theme.C_TEXT_DIM))
+        cursor.insertText(f"[{ts}] ", prefix_fmt)
+        if source:
+            src_fmt = QTextCharFormat()
+            src_fmt.setForeground(QColor(theme.C_ACCENT))
+            cursor.insertText(f"{source} ", src_fmt)
+        body_fmt = QTextCharFormat()
+        body_fmt.setForeground(QColor(color))
+        cursor.insertText(text + "\n", body_fmt)
+        self._edit.setTextCursor(cursor)
+
+    def info(self, text: str, source: str = "") -> None:
+        self._write(text, theme.C_TEXT, source)
+
+    def ok(self, text: str) -> None:
+        self._write(text, theme.C_OK)
+
+    def warn(self, text: str) -> None:
+        self._write(text, theme.C_WARN)
+
+    def error(self, text: str) -> None:
+        self._write(text, theme.C_ERR)
+
+    def backend(self, text: str) -> None:
+        self._write(text, theme.C_TEXT_DIM, source="后端")
+
+    def clear(self) -> None:
+        self._edit.clear()
+
+
+# ================================================================ 兼容旧接口
 
 class WorldPanel(QGroupBox):
-    """世界信息（load_world 返回值 + 本地 spec 概要）。"""
+    """世界概要（旧接口，新布局里不再使用，保留以免外部引用失效）。"""
 
     def __init__(self, parent=None):
         super().__init__("世界", parent)
@@ -28,7 +495,7 @@ class WorldPanel(QGroupBox):
 
 
 class TaskPanel(QGroupBox):
-    """任务状态：tick / 时间 / 成败 / 奖励（大字）。"""
+    """任务状态（旧接口，新布局用 PropertiesPanel；保留兼容）。"""
 
     def __init__(self, parent=None):
         super().__init__("任务", parent)
@@ -63,55 +530,116 @@ class TaskPanel(QGroupBox):
             lb.setText("-")
 
 
-class ObsPanel(QGroupBox):
-    """观测树：逐机器人关节 qpos/ctrl + 传感器读数 + 物体 pos/quat。"""
+# ================================================================ 代码编辑器
+
+_PY_KW = frozenset((
+    "and as assert async await break class continue def del elif else except "
+    "finally for from global if import in is lambda nonlocal not or pass raise "
+    "return try while with yield True False None").split())
+
+
+class PyHighlighter(QSyntaxHighlighter):
+    """Python 语法高亮：字符串/注释/关键字/内置常量/类名（零依赖近似版）。"""
 
     def __init__(self, parent=None):
-        super().__init__("观测", parent)
-        self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["名称", "值"])
-        self._tree.setAlternatingRowColors(True)
-        lay = QVBoxLayout(self)
-        lay.addWidget(self._tree)
+        super().__init__(parent)
+        self._fmt_str = QTextCharFormat()
+        self._fmt_str.setForeground(QColor("#7EE787"))
+        self._fmt_com = QTextCharFormat()
+        self._fmt_com.setForeground(QColor("#8B949E"))
+        self._fmt_com.setFontItalic(True)
+        self._fmt_kw = QTextCharFormat()
+        self._fmt_kw.setForeground(QColor("#FF7B72"))
+        self._fmt_kw.setFontWeight(QFont.Weight.Bold)
+        self._fmt_num = QTextCharFormat()
+        self._fmt_num.setForeground(QColor("#79C0FF"))
 
-    def update_obs(self, obs: dict) -> None:
-        self._tree.clear()
-        for rname, robs in (obs.get("robots") or {}).items():
-            top = QTreeWidgetItem([rname])
-            names = robs.get("joint_names") or []
-            qpos = robs.get("qpos") or []
-            ctrl = robs.get("ctrl") or []
-            for i, jn in enumerate(names):
-                v = f"q={qpos[i]:+.3f}" if i < len(qpos) else ""
-                if i < len(ctrl):
-                    v += f" u={ctrl[i]:+.3f}"
-                QTreeWidgetItem(top, [jn, v])
-            sensors = robs.get("sensors") or {}
-            if sensors:                        # M2：有传感器才有该键
-                st = QTreeWidgetItem(top, ["sensors"])
-                for sn, sv in sensors.items():
-                    if isinstance(sv, list):
-                        sv = "(" + ", ".join(f"{x:+.3f}" for x in sv) + ")"
-                    else:
-                        sv = f"{sv:+.3f}"
-                    QTreeWidgetItem(st, [sn, sv])
-            self._tree.addTopLevelItem(top)
-        for oname, oinfo in (obs.get("objects") or {}).items():
-            pos = oinfo.get("pos") or []
-            quat = oinfo.get("quat") or []
-            top = QTreeWidgetItem([
-                oname,
-                f"pos=({', '.join(f'{x:+.2f}' for x in pos)}) "
-                f"quat=({', '.join(f'{x:+.2f}' for x in quat)})"])
-            self._tree.addTopLevelItem(top)
-        self._tree.expandAll()
-
-    def clear(self) -> None:
-        self._tree.clear()
+    def highlightBlock(self, text: str) -> None:
+        import re as _re
+        for m in _re.finditer(r'"[^"\n]*"|\'[^\'\n]*\'', text):
+            self.setFormat(m.start(), m.end() - m.start(), self._fmt_str)
+        for m in _re.finditer(r'#[^\n]*', text):
+            self.setFormat(m.start(), m.end() - m.start(), self._fmt_com)
+        for m in _re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]*\b|\b\d[\w.]*\b', text):
+            w = m.group()
+            if w in _PY_KW:
+                self.setFormat(m.start(), len(w), self._fmt_kw)
+            elif w[0].isdigit():
+                self.setFormat(m.start(), len(w), self._fmt_num)
 
 
-def make_side_panel() -> tuple[QWidget, "dict"]:
-    """组装右侧面板栈，返回 (容器, 各面板引用)。"""
+class CodePanel(QWidget):
+    """代码页：控制律即改即跑（Webots 式内置编辑器）。
+
+    set_world 填充控制器下拉；saveRequested(name, text) 由 app 侧落盘 +
+    重载世界（重启控制器进程）+ 自动运行。Ctrl+S 在编辑框聚焦时等同保存。
+    """
+
+    saveRequested = Signal(str, str)          # robot 名, 文件全文
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        bar = QHBoxLayout()
+        self.combo = QComboBox()
+        self.combo.setToolTip("选择要编辑的机器人控制器")
+        self.combo.currentTextChanged.connect(self._load_current)
+        bar.addWidget(self.combo, stretch=1)
+        btn_reload = QPushButton("重读")
+        btn_reload.setToolTip("放弃修改，从磁盘重读当前控制器")
+        btn_reload.clicked.connect(self._load_current)
+        bar.addWidget(btn_reload)
+        btn_save = QPushButton("保存并运行")
+        btn_save.setToolTip("写回控制器文件 -> 重载世界（控制器进程重启，新代码生效）"
+                            "-> 自动运行")
+        btn_save.clicked.connect(self._on_save)
+        bar.addWidget(btn_save)
+        v.addLayout(bar)
+        self.edit = QPlainTextEdit()
+        self.edit.setFont(QFont("DejaVu Sans Mono", 10))
+        self.edit.setPlaceholderText("加载世界后自动载入控制器代码…")
+        self._hl = PyHighlighter(self.edit.document())
+        # 编辑框聚焦时 Ctrl+S = 保存并运行（优先于全局截图快捷键）
+        sc = QShortcut(QKeySequence.StandardKey.Save, self.edit)
+        sc.activated.connect(self._on_save)
+        v.addWidget(self.edit, stretch=1)
+        self._paths: dict[str, str] = {}       # robot 名 -> 控制器绝对路径
+
+    def set_world(self, spec, base_dir) -> None:
+        """加载/重载世界后刷新控制器清单（相对路径按世界目录解析）。"""
+        self._paths = {r.name: str((pathlib.Path(base_dir) / r.controller).resolve())
+                       for r in spec.robots if r.controller}
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItems(list(self._paths) or ["（当前世界没有控制器）"])
+        self.combo.blockSignals(False)
+        if self._paths:
+            self._load_current()
+        else:
+            self.edit.setPlainText(
+                "# 当前世界的机器人没有绑定控制器。\n"
+                "# 用 模型库 → 生成并打开 可获得带控制律模板的项目。")
+
+    def _load_current(self) -> None:
+        name = self.combo.currentText()
+        path = self._paths.get(name)
+        if not path:
+            return
+        try:
+            self.edit.setPlainText(pathlib.Path(path).read_text(encoding="utf-8"))
+        except OSError as e:
+            self.edit.setPlainText(f"# 读取 {path} 失败: {e}")
+
+    def _on_save(self) -> None:
+        name = self.combo.currentText()
+        if name not in self._paths:
+            return
+        self.saveRequested.emit(name, self.edit.toPlainText())
+
+
+def make_side_panel() -> tuple[QWidget, dict]:
+    """旧接口：右侧竖排（新主窗口已不用，保留向后兼容）。"""
     world, task, obs = WorldPanel(), TaskPanel(), ObsPanel()
     box = QWidget()
     lay = QVBoxLayout(box)
@@ -119,3 +647,153 @@ def make_side_panel() -> tuple[QWidget, "dict"]:
     lay.addWidget(task)
     lay.addWidget(obs, stretch=1)
     return box, {"world": world, "task": task, "obs": obs}
+
+
+# ================================================================ Agent 控制台
+
+class AgentPanel(QWidget):
+    """Agent 控制台：聊天 + 配置（OpenAI 兼容端点）+ 工具桥接。
+
+    与 GUI 同构工作流：AI 调 zoo_create/load_world/run + 本地 write_file/read_file，
+    用户可在聊天里让 AI 生成场景、写代码、运行验证。worker QThread 不阻塞 UI。
+    """
+
+    sendRequested = Signal(str)            # 用户文本 -> AgentWorker
+    stopRequested = Signal()                # 停止 -> worker
+    configureRequested = Signal()           # 打开配置对话框
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+
+        bar = QHBoxLayout()
+        self.btn_config = QPushButton("配置")
+        self.btn_config.setToolTip("配置 OpenAI 兼容端点（base_url/api_key/model）")
+        self.btn_config.clicked.connect(self.configureRequested.emit)
+        bar.addWidget(self.btn_config)
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip("打断当前对话（不让 LLM 继续调工具）")
+        self.btn_stop.clicked.connect(self.stopRequested.emit)
+        bar.addWidget(self.btn_stop)
+        bar.addStretch(1)
+        self.lbl_state = QLabel("未配置")
+        bar.addWidget(self.lbl_state)
+        v.addLayout(bar)
+
+        self.chat = QPlainTextEdit()
+        self.chat.setReadOnly(True)
+        self.chat.setFont(QFont("DejaVu Sans Mono", 10))
+        self.chat.setPlaceholderText("配置好 API 后在此向 AI 下达任务…")
+        v.addWidget(self.chat, stretch=1)
+
+        bar2 = QHBoxLayout()
+        self.input = QPlainTextEdit()
+        self.input.setFixedHeight(80)
+        self.input.setPlaceholderText("对 AI 说话（Enter 发送，Shift+Enter 换行）")
+        self.input.keyPressEvent = self._input_key_press
+        bar2.addWidget(self.input, stretch=1)
+        btn_send = QPushButton("发送")
+        btn_send.clicked.connect(self._on_send)
+        bar2.addWidget(btn_send)
+        v.addLayout(bar2)
+
+    def _input_key_press(self, event):
+        from PySide6.QtCore import Qt as _Qt
+        # Enter 发送、Shift+Enter 换行
+        if (event.key() in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter)
+                and not event.modifiers() & _Qt.KeyboardModifier.ShiftModifier):
+            self._on_send()
+            return
+        QPlainTextEdit.keyPressEvent(self.input, event)
+
+    def _on_send(self):
+        text = self.input.toPlainText().strip()
+        if text:
+            self.input.clear()
+            self.sendRequested.emit(text)
+
+    # ------------------------------------------------------------ UI 回写
+
+    def append_user(self, text: str) -> None:
+        self._append(f"[你] {text}", theme.C_TEXT)
+
+    def append_assistant(self, text: str) -> None:
+        self._append(f"[AI] {text}", theme.C_OK)
+
+    def append_tool(self, name: str, args: dict) -> None:
+        self._append(f"  ↪ 调用 {name}({args})", theme.C_TEXT_DIM)
+
+    def append_result(self, name: str, result) -> None:
+        if isinstance(result, dict) and "error" in result:
+            color = theme.C_ERR
+            text = f"  ← {name}: {result}"
+        else:
+            color = theme.C_TEXT_DIM
+            preview = str(result)
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+            text = f"  ← {name}: {preview}"
+        self._append(text, color)
+
+    def append_error(self, text: str) -> None:
+        self._append(f"[错误] {text}", theme.C_ERR)
+
+    def set_state(self, configured: bool, busy: bool) -> None:
+        if configured:
+            self.lbl_state.setText("运行中…" if busy else "就绪")
+            self.lbl_state.setStyleSheet(
+                f"color:{theme.C_OK if not busy else theme.C_WARN};"
+                "font-weight:600;")
+        else:
+            self.lbl_state.setText("未配置")
+            self.lbl_state.setStyleSheet(
+                f"color:{theme.C_TEXT_DIM};font-weight:600;")
+        self.btn_stop.setEnabled(busy)
+        self.input.setEnabled(not busy)
+
+    def _append(self, text: str, color: str) -> None:
+        cursor = self.chat.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.insertText(text + "\n", fmt)
+        self.chat.setTextCursor(cursor)
+        self.chat.verticalScrollBar().setValue(
+            self.chat.verticalScrollBar().maximum())
+
+
+class AgentConfigDialog(QDialog):
+    """Agent 配置对话框：base_url / api_key / model 三项（持久化）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Agent 配置")
+        from agentsim.agent import load_config
+        self._cfg = load_config()
+        lay = QFormLayout(self)
+        self.ed_url = QLineEdit(self._cfg.base_url)
+        self.ed_url.setPlaceholderText("https://api.openai.com/v1 或 "
+                                      "https://api.deepseek.com/v1")
+        lay.addRow("base_url", self.ed_url)
+        self.ed_key = QLineEdit(self._cfg.api_key)
+        self.ed_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ed_key.setPlaceholderText("sk-…（本地 Ollama 等可留空）")
+        lay.addRow("api_key", self.ed_key)
+        self.ed_model = QLineEdit(self._cfg.model)
+        self.ed_model.setPlaceholderText("如 gpt-4o-mini / deepseek-chat / llama3")
+        lay.addRow("model", self.ed_model)
+        btns = QHBoxLayout()
+        ok = QPushButton("保存")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1); btns.addWidget(cancel); btns.addWidget(ok)
+        lay.addRow("", btns)
+
+    def config(self) -> "AgentConfig":
+        from agentsim.agent import AgentConfig
+        return AgentConfig(base_url=self.ed_url.text().strip(),
+                           api_key=self.ed_key.text().strip(),
+                           model=self.ed_model.text().strip())

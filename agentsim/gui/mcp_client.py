@@ -84,6 +84,7 @@ class McpClient(QObject):
     """
 
     backendDied = Signal(str)            # 后端异常退出（msg）
+    backendLog = Signal(str)             # 后端 stderr 一行日志（控制台显示）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,7 +98,8 @@ class McpClient(QObject):
     def start(self) -> None:
         self._proc = QProcess(self)
         self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
-        self._proc.readyRead.connect(self._on_ready_read)
+        self._proc.readyReadStandardOutput.connect(self._on_ready_read)
+        self._proc.readyReadStandardError.connect(self._on_ready_err)
         self._proc.finished.connect(self._on_finished)
         self._proc.errorOccurred.connect(
             lambda err: self.backendDied.emit(f"后端进程错误: {err}"))
@@ -164,6 +166,13 @@ class McpClient(QObject):
                 continue                  # 服务器输出的坏行直接忽略
             if isinstance(resp, dict):
                 self._pending.dispatch(resp)
+
+    def _on_ready_err(self) -> None:
+        chunk = bytes(self._proc.readAllStandardError()).decode("utf-8",
+                                                                 errors="replace")
+        for line in chunk.splitlines():
+            if line.strip():
+                self.backendLog.emit(line)
 
     def _on_finished(self, code, status) -> None:
         if code != 0 or status != QProcess.ExitStatus.NormalExit:

@@ -168,7 +168,9 @@ _TOOLS = [
                        "世界 YAML + 控制器模板（含执行器清单与 API 注释），"
                        "生成后 load_world 打开、改控制律即编程。"
                        "首次用某模型会联网下载一次（之后永久离线）。"
-                       "key 列表见返回的 models 字段，或传 key='list' 只列清单。",
+                       "key 列表见返回的 models 字段，或传 key='list' 只列清单。"
+                       "demo=true 时另生成 demo.py 运动演示（四足小跑/臂扫掠/"
+                       "人形摆臂）且世界指向它——load_world + run 即可看动画。",
         "inputSchema": {
             "type": "object",
             "required": ["key"],
@@ -176,7 +178,15 @@ _TOOLS = [
                 "key": {"type": "string",
                         "description": "模型 key（如 unitree_go2）或 'list'"},
                 "out_dir": {"type": "string",
-                            "description": "输出目录，缺省 ~/.agentsim/zoo/<key>"},
+                             "description": "输出目录，缺省 ~/.agentsim/zoo/<key>"},
+                "ensure_only": {"type": "boolean",
+                                 "description": "不生成项目，只确保模型已缓存，"
+                                                "返回 xml 路径与建议初始 pos "
+                                                "（GUI 拖放添加机器人用）"},
+                "demo": {"type": "boolean",
+                          "description": "生成运动演示（demo.py）：四足对角小跑、"
+                                         "机械臂/灵巧手关节扫掠、人形站立摆臂；"
+                                         "世界指向 demo.py，load_world+run 即看动画"},
             },
         },
     },
@@ -447,18 +457,28 @@ class AgentSimSession:
         return self.yaml_text
 
     def _tool_zoo_create(self, args: dict):
-        """模型库生成：key='list' 列清单，否则生成世界+控制器模板。"""
-        from agentsim.zoo import MODELS, generate
+        """模型库生成：key='list' 列清单；ensure_only 只取模型路径；否则生成项目。"""
+        from agentsim.zoo import MODELS, ensure_model, generate
         key = str(args.get("key", ""))
         if key == "list":
             return {"models": [
                 {"key": k, "title": m["title"], "category": m["cat"],
                  "desc": m["desc"]}
                 for k, m in MODELS.items()]}
+        if args.get("ensure_only"):
+            # GUI 拖放添加机器人用：只确保模型已缓存，返回 xml 路径与建议初始高度
+            xml = ensure_model(key)             # 未缓存会先下载一次
+            return {"key": key, "title": MODELS[key]["title"],
+                    "xml": str(xml), "pos": list(MODELS[key]["pos"])}
         out_dir = args.get("out_dir")
-        r = generate(key, out_dir=out_dir)     # 未缓存模型会先下载一次
-        r["hint"] = ("已生成。load_world 打开 " + r["world"] +
-                     "，编辑 " + r["controller"] + " 写控制律后重新 run")
+        r = generate(key, out_dir=out_dir, demo=bool(args.get("demo")))
+        if "demo" in r:                        # 运动演示项目
+            r["hint"] = ("已生成运动演示。load_world 打开 " + r["world"] +
+                         "，run 即可看 " + MODELS[key]["title"] + " 的演示动作；"
+                         "写自己的控制律用 " + r["controller"])
+        else:
+            r["hint"] = ("已生成。load_world 打开 " + r["world"] +
+                         "，编辑 " + r["controller"] + " 写控制律后重新 run")
         return r
 
     def _tool_screenshot(self, args: dict):
