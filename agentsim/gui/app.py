@@ -24,16 +24,17 @@ import yaml
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
-                               QDialog, QDockWidget, QFileDialog, QHBoxLayout,
-                               QLabel, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QPushButton,
-                               QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                               QDialog, QDockWidget, QFileDialog, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QPushButton, QSpinBox,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 from agentsim.gui import theme
 from agentsim.gui.mcp_client import McpClient
 from agentsim.gui.panels import (AgentConfigDialog, AgentPanel, CodePanel,
-                                 ConsolePanel, ObsPanel, PropertiesPanel,
-                                 SceneTreePanel)
+                                 ConsolePanel, GearPanel, ObsPanel,
+                                 PropertiesPanel, SceneTreePanel)
 from agentsim.gui.render_view import RenderView, _CAM_PRESETS
 from agentsim.gui.state import UiState
 from agentsim.world.schema import load_world as parse_world_file
@@ -110,6 +111,71 @@ class ZooDialog(QDialog):
         return it.data(Qt.ItemDataRole.UserRole) if it else None
 
 
+class NewSceneDialog(QDialog):
+    """新建场景：选参数化模板 -> 生成世界 YAML（含码垛分区 pallet）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("新建场景")
+        self.resize(520, 360)
+        from agentsim.scene_gen import TEMPLATES
+        self._templates = TEMPLATES
+        self._param_widgets = {}
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.cmb = QComboBox()
+        for key, (desc, _params, _fn) in TEMPLATES.items():
+            self.cmb.addItem(f"{key} —— {desc}", key)
+        self.cmb.currentIndexChanged.connect(self._populate_params)
+        form.addRow("模板：", self.cmb)
+        self.params_box = QGroupBox("模板参数")
+        self.params_form = QFormLayout(self.params_box)
+        form.addRow(self.params_box)
+        lay.addLayout(form)
+
+        self.tip = QLabel()
+        self.tip.setWordWrap(True)
+        lay.addWidget(self.tip)
+        lay.addStretch(1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("生成并加载")
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(cancel); row.addWidget(ok)
+        lay.addLayout(row)
+        self._populate_params()
+
+    def _populate_params(self):
+        while self.params_form.rowCount():
+            self.params_form.removeRow(0)
+        self._param_widgets = {}
+        key = self.cmb.currentData()
+        desc, params, _fn = self._templates[key]
+        self.tip.setText(desc)
+        for pname, (typ, default, hint) in params.items():
+            if typ is int:
+                w = QSpinBox()
+                w.setRange(0, 100)
+                w.setValue(int(default))
+            else:
+                w = QLineEdit(str(default))
+            self.params_form.addRow(f"{pname}（{hint}）：", w)
+            self._param_widgets[pname] = (typ, w)
+
+    def selection(self) -> tuple[str, dict]:
+        key = self.cmb.currentData()
+        params = {}
+        for pname, (typ, w) in self._param_widgets.items():
+            params[pname] = w.value() if typ is int else w.text().strip()
+        return key, params
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,10 +216,15 @@ class MainWindow(QMainWindow):
         self.agent.sendRequested.connect(self._on_agent_send)
         self.agent.stopRequested.connect(self._on_agent_stop)
         self.agent.configureRequested.connect(self._on_agent_config)
+        self.gear = GearPanel()
+        self.gear.apply_gripper.connect(self._on_gear_gripper)
+        self.gear.add_sensor.connect(self._on_gear_add_sensor)
+        self.gear.remove_sensor.connect(self._on_gear_remove_sensor)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.props, "属性")
         self.tabs.addTab(self.obs, "观测")
+        self.tabs.addTab(self.gear, "装备")
         self.tabs.addTab(self.code, "代码")
         self.tabs.addTab(self.agent, "Agent")
 
@@ -220,6 +291,8 @@ class MainWindow(QMainWindow):
             return a
 
         self.act_open = mk("打开世界…", "Ctrl+O", "加载一个世界 YAML 文件")
+        self.act_new_scene = mk("新建场景…", "Ctrl+N", "从参数化模板生成场景"
+                                "（含码垛分区 pallet）")
         self.act_zoo = mk("机器人模型库…", "Ctrl+M", "从官方模型库生成项目")
         self.act_quit = mk("退出", "Ctrl+Q")
         self.act_quit.triggered.connect(self.close)
@@ -264,6 +337,7 @@ class MainWindow(QMainWindow):
 
         m_file = mb.addMenu("文件(&F)")
         m_file.addAction(self.act_open)
+        m_file.addAction(self.act_new_scene)
         m_file.addAction(self.act_zoo)
         m_file.addSeparator()
         m_file.addAction(self.act_screenshot)
@@ -331,6 +405,7 @@ class MainWindow(QMainWindow):
 
         # 信号
         self.act_open.triggered.connect(self._on_load)
+        self.act_new_scene.triggered.connect(self._on_new_scene)
         self.act_zoo.triggered.connect(self._on_zoo)
         self.act_reset.triggered.connect(self._on_reset)
         self.act_run.triggered.connect(self._on_run)
@@ -406,6 +481,44 @@ class MainWindow(QMainWindow):
         self._log(f"加载世界：{path}")
         self.client.call_tool(
             "load_world", {"yaml_path": path},
+            lambda e, d: self._on_loaded(e, d, spec))
+
+    def _on_new_scene(self):
+        dlg = NewSceneDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        key, params = dlg.selection()
+        # 先生成到临时目录拿世界名，再让用户选保存位置（路径写进相对基准）
+        try:
+            from agentsim.scene_gen import generate
+            import tempfile
+            tmp = tempfile.mkdtemp(prefix="agentsim_scene_")
+            preview = generate(key, tmp, params)
+            name = yaml.safe_load(preview).get("name", key)
+        except Exception as e:
+            self._apply_state(f"场景生成失败: {e}")
+            self._log(f"场景生成失败: {e}", "error")
+            QMessageBox.critical(self, "新建场景", f"生成失败：{e}")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存新场景", f"worlds/{name}.yaml",
+            "World YAML (*.yaml *.yml)")
+        if not path:
+            return
+        import pathlib
+        out = pathlib.Path(path)
+        try:
+            text = generate(key, out.parent, params)   # 按保存目录重算相对路径
+            out.write_text(text, encoding="utf-8")
+            spec = parse_world_file(out)
+        except Exception as e:
+            self._apply_state(f"场景保存失败: {e}")
+            self._log(f"场景保存失败: {e}", "error")
+            QMessageBox.critical(self, "新建场景", f"保存失败：{e}")
+            return
+        self._log(f"已生成场景 {name}（模板 {key}）：{out}", "ok")
+        self.client.call_tool(
+            "load_world", {"yaml_path": str(out)},
             lambda e, d: self._on_loaded(e, d, spec))
 
     def _on_screenshot(self):
@@ -798,6 +911,101 @@ class MainWindow(QMainWindow):
             self._pending_run = False
             if self.state.can("run"):
                 self._do_run(self._run_args())
+        # 刷新装备面板（夹爪目录 + 机器人挂点/关节/body 清单）
+        self.client.call_tool("get_robot_manifest", {}, self._on_manifest)
+
+    def _on_manifest(self, err, data):
+        if not err and data:
+            self.gear.set_manifest(data, str(self._base_dir))
+
+    # ============================================================ 装备面板
+
+    def _on_gear_gripper(self, robot_name: str, gripper: dict | None):
+        """应用/移除夹爪：改 robots[i].gripper 后全文重载。"""
+        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+            return
+
+        def got_yaml(err, text):
+            if err:
+                self._log(f"read_world 失败: {text}", "error"); return
+            try:
+                d = yaml.safe_load(text)
+                rd = next((r for r in d.get("robots") or []
+                           if r.get("name") == robot_name), None)
+                if rd is None:
+                    self._log(f"世界 YAML 里没找到机器人 '{robot_name}'", "warn")
+                    return
+                if gripper is None:
+                    rd.pop("gripper", None)
+                    msg = f"{robot_name} 已移除夹爪"
+                else:
+                    rd["gripper"] = gripper
+                    msg = f"{robot_name} 已装配夹爪 {gripper['model']}"
+                new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            except Exception as e:
+                self._log(f"YAML 修改失败: {e}", "error"); return
+            self._pending_select = ("robot", robot_name)
+            self._reload_yaml(new_text, ok_msg=msg)
+
+        self.client.call_tool("read_world", {}, got_yaml)
+
+    def _on_gear_add_sensor(self, robot_name: str, sensor: dict):
+        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+            return
+
+        def got_yaml(err, text):
+            if err:
+                self._log(f"read_world 失败: {text}", "error"); return
+            try:
+                d = yaml.safe_load(text)
+                rd = next((r for r in d.get("robots") or []
+                           if r.get("name") == robot_name), None)
+                if rd is None:
+                    self._log(f"世界 YAML 里没找到机器人 '{robot_name}'", "warn")
+                    return
+                sl = rd.setdefault("sensors", [])
+                if any(s.get("name") == sensor["name"] for s in sl):
+                    self._log(f"传感器名 '{sensor['name']}' 已存在", "warn")
+                    return
+                sl.append(sensor)
+                new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            except Exception as e:
+                self._log(f"YAML 修改失败: {e}", "error"); return
+            self._pending_select = ("robot", robot_name)
+            self._reload_yaml(new_text,
+                              ok_msg=f"{robot_name} 新增 {sensor['type']} "
+                                     f"传感器 {sensor['name']}")
+
+        self.client.call_tool("read_world", {}, got_yaml)
+
+    def _on_gear_remove_sensor(self, robot_name: str, sensor_name: str):
+        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+            return
+
+        def got_yaml(err, text):
+            if err:
+                self._log(f"read_world 失败: {text}", "error"); return
+            try:
+                d = yaml.safe_load(text)
+                rd = next((r for r in d.get("robots") or []
+                           if r.get("name") == robot_name), None)
+                if rd is None:
+                    self._log(f"世界 YAML 里没找到机器人 '{robot_name}'", "warn")
+                    return
+                sl = rd.get("sensors") or []
+                before = len(sl)
+                rd["sensors"] = [s for s in sl if s.get("name") != sensor_name]
+                if len(rd["sensors"]) == before:
+                    self._log(f"传感器 '{sensor_name}' 不存在", "warn")
+                    return
+                new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            except Exception as e:
+                self._log(f"YAML 修改失败: {e}", "error"); return
+            self._pending_select = ("robot", robot_name)
+            self._reload_yaml(new_text,
+                              ok_msg=f"{robot_name} 已删除传感器 {sensor_name}")
+
+        self.client.call_tool("read_world", {}, got_yaml)
 
     def _on_reset(self):
         if not self.state.can("reset"):

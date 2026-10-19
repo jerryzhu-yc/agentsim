@@ -310,3 +310,150 @@ def test_code_panel_save_signal(qapp, tmp_path):
         assert "没有绑定控制器" in p.edit.toPlainText()
     finally:
         p.deleteLater()
+
+
+# ================================================================ M6 装备面板
+
+def _gear_manifest():
+    return {
+        "robots": [{
+            "name": "arm",
+            "controller": "none",
+            "args": {},
+            "actuators": [{"name": "a1", "ctrlrange": [-1.0, 1.0]}],
+            "joints": [{"name": "j1", "type": "hinge", "limited": True,
+                        "range": [-3.14, 3.14]}],
+            "sites": ["attachment_site", "gripper/left_pad_site"],
+            "bodies": {"arm/base": "base", "arm/link1": "link1"},
+            "sensors": [{"name": "wrist_imu", "type": "imu", "dim": 6}],
+            "cameras": [],
+            "gripper": None,
+        }],
+        "gripper_catalog": [
+            {"key": "onrobot_2fg7", "title": "OnRobot 2FG7 平行夹爪",
+             "cat": "parallel", "open": 0.0, "close": 0.038,
+             "supported_robots": ["ur5e.xml"]}],
+    }
+
+
+def test_gear_panel_apply_gripper(qapp):
+    from agentsim.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.apply_gripper.connect(lambda r, g: got.append((r, g)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        assert p._robot_combo.currentData()["name"] == "arm"
+        # 选中目录里的 2FG7 并应用
+        idx = p._gripper_combo.findData("onrobot_2fg7")
+        assert idx >= 0
+        p._gripper_combo.setCurrentIndex(idx)
+        p._on_apply_gripper()
+        assert got == [("arm", {"model": "onrobot_2fg7"})]
+        # 移除夹爪
+        p._on_remove_gripper()
+        assert got[-1] == ("arm", None)
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_gripper_with_pose(qapp):
+    """填了 pos/rot 时发出的 gripper dict 带 pos/quat。"""
+    from agentsim.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.apply_gripper.connect(lambda r, g: got.append(g))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._gripper_combo.setCurrentIndex(
+            p._gripper_combo.findData("onrobot_2fg7"))
+        p._site_combo.setCurrentIndex(
+            p._site_combo.findData("gripper/left_pad_site"))
+        p._pos_spins[2].setValue(0.01)
+        p._rot_spins[2].setValue(90.0)
+        p._on_apply_gripper()
+        g = got[0]
+        assert g["model"] == "onrobot_2fg7"
+        assert g["site"] == "gripper/left_pad_site"
+        assert g["pos"] == [0.0, 0.0, 0.01]
+        # yaw 90deg -> wxyz ≈ (0.7071, 0, 0, 0.7071)
+        assert g["quat"][0] == pytest.approx(0.7071, abs=1e-3)
+        assert g["quat"][3] == pytest.approx(0.7071, abs=1e-3)
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_add_body_sensor(qapp):
+    """tactile 走 body 引用，并携带 radius。"""
+    from agentsim.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.add_sensor.connect(lambda r, s: got.append((r, s)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_type.setCurrentText("tactile")
+        assert p._ref_stack.currentIndex() == 1      # body 页
+        p._ref_body.setCurrentText("link1")
+        p._sensor_name.setText("pad_touch")
+        p._radius_spin.setValue(0.02)
+        p._on_add_sensor()
+        assert got == [("arm", {"name": "pad_touch", "type": "tactile",
+                                "body": "link1", "radius": 0.02})]
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_add_joint_sensor(qapp):
+    from agentsim.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.add_sensor.connect(lambda r, s: got.append(s))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_type.setCurrentText("encoder")
+        assert p._ref_stack.currentIndex() == 0      # joint 页
+        p._sensor_name.setText("j1_enc")
+        p._on_add_sensor()
+        assert got == [{"name": "j1_enc", "type": "encoder", "joint": "j1"}]
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_remove_sensor(qapp):
+    from agentsim.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.remove_sensor.connect(lambda r, s: got.append((r, s)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_list.setCurrentRow(0)
+        p._on_remove_sensor()
+        assert got == [("arm", "wrist_imu")]
+    finally:
+        p.deleteLater()
+
+
+def test_new_scene_dialog_selection(qapp):
+    """M6 新建场景对话框：切模板时参数表单跟随变化。"""
+    from agentsim.gui.app import NewSceneDialog
+    dlg = NewSceneDialog()
+    try:
+        # 默认含 pallet
+        keys = [dlg.cmb.itemData(i) for i in range(dlg.cmb.count())]
+        assert "pallet" in keys
+        # 切到 pallet：参数只有 cubes
+        dlg.cmb.setCurrentIndex(keys.index("pallet"))
+        key, params = dlg.selection()
+        assert key == "pallet"
+        assert params == {"cubes": 3}
+        # 改 cubes
+        w = dlg._param_widgets["cubes"][1]
+        w.setValue(5)
+        assert dlg.selection() == ("pallet", {"cubes": 5})
+        # 切到 maze：参数变 rows/cols
+        dlg.cmb.setCurrentIndex(keys.index("maze"))
+        key, params = dlg.selection()
+        assert key == "maze"
+        assert set(params) == {"rows", "cols"}
+    finally:
+        dlg.deleteLater()

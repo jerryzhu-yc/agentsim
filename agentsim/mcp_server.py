@@ -34,6 +34,7 @@ import yaml
 
 from agentsim import supervisor
 from agentsim.errors import WorldError
+from agentsim.grippers import GRIPPERS as _GRIPPERS
 from agentsim.kernel.sim import Simulation
 from agentsim.render import encode_png, render_offscreen
 from agentsim.world.schema import load_world as _load_world_file
@@ -429,16 +430,39 @@ class AgentSimSession:
                     "limited": bool(m.jnt_limited[jid]),
                     "range": [float(x) for x in m.jnt_range[jid]],
                 })
+            # sites（挂点）：扫描编译模型，按机器人前缀过滤；夹爪内 site
+            # 全名 "<robot>/gripper/..."，短名保留 gripper/ 前缀以便引用
+            prefix = f"{rd.name}/"
+            sites = []
+            for sid in range(m.nsite):
+                full = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_SITE, sid)
+                if full and full.startswith(prefix):
+                    sites.append(full[len(prefix):])
+            sites.sort()
+
+            gripper = None
+            if rd.gripper is not None:
+                info = None
+                if rd.gripper.model in _GRIPPERS:
+                    gi = _GRIPPERS[rd.gripper.model]
+                    info = {"key": rd.gripper.model, "title": gi["title"],
+                            "actuator": f"gripper/{gi['actuator']}",
+                            "open": gi["open"], "close": gi["close"]}
+                gripper = {"model": rd.gripper.model,
+                           "site": rd.gripper.site, "info": info}
+
             robots.append({
                 "name": rd.name,
                 "controller": rd.controller,
                 "args": rd.args,
                 "actuators": actuators,
                 "joints": joints,
+                "sites": sites,
                 "bodies": {f"{rd.name}/{short}": short for short in ridx.bodies},
                 "sensors": [{"name": six.name, "type": six.kind, "dim": six.dim}
                             for six in ridx.sensors.values()],
                 "cameras": list(ridx.cameras),
+                "gripper": gripper,
             })
         return {
             "world": self.spec.name,
@@ -447,6 +471,11 @@ class AgentSimSession:
             "robots": robots,
             "objects": [{"name": o.name, "type": o.type, "pos": list(o.pos)}
                         for o in self.spec.scene.objects],
+            "gripper_catalog": [
+                {"key": k, "title": v["title"], "cat": v["cat"],
+                 "open": v["open"], "close": v["close"],
+                 "supported_robots": sorted(v["mounts"])}
+                for k, v in _GRIPPERS.items()],
         }
 
     def _tool_save_state(self, args: dict):

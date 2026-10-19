@@ -32,10 +32,11 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 - **进程级控制器隔离**：每个机器人的控制器是独立 OS 进程，通过 ZMQ REQ/ROUTER 与内核栅栏同步；控制器崩溃、超时都不会死锁内核
 - **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真，包括让 Agent 用 `screenshot` 截取仿真画面"亲眼"看世界
 - **传感器系统**：YAML 里给机器人声明 encoder / IMU / 触觉 / 关节力矩 / 相机五类传感器，编译进 MuJoCo 模型、读数进观测流，GUI 面板实时显示；传感器是只读派生量，不改变物理轨迹（bit 级守护测试保证）
-- **机器人模型库**：MuJoCo Menagerie 官方模型一键接入——预配置 13 个著名机器人（Unitree Go1/Go2/H1/G1、ANYmal C、Spot、Franka Panda、UR5e、xArm7、Shadow Hand、ALOHA 等），GUI 点"模型库"选模型即生成世界 + 控制器模板并自动打开编辑器，改完控制律点 Run 即跑；AI Agent 走同一条 `zoo_create` 工具
+- **机器人模型库**：MuJoCo Menagerie 官方模型一键接入——预配置 14 个著名机器人（Unitree Go1/Go2/H1/G1、ANYmal C、Spot、Franka Panda、UR5e/UR10e、xArm7、Shadow Hand、ALOHA 等），GUI 点"模型库"选模型即生成世界 + 控制器模板并自动打开编辑器，改完控制律点 Run 即跑；AI Agent 走同一条 `zoo_create` 工具
+- **夹爪装配工作台**：内置 OnRobot 2FG7 平行夹爪，GUI"装备"页点选即可给 UR5e / UR10e / xArm7 / Panda 四臂挂爪/拆爪，并可视化挂点、关节、body 清单；同一页表单式添加五类传感器（encoder/IMU/触觉/关节力矩/相机），全部改 YAML 自动重载，不手写配置。夹爪安装位姿（mount）对四臂统一标定，与官方参考场景逐位吻合；自带"码垛分区"场景模板（UR5e+2FG7，A 区取料→B 区码放）
 - **RL 训练接口**：一个 YAML 世界 = 一个确定性 gymnasium.Env——动作空间 = 执行器拼接、观测 = qpos/qvel/传感器、reset 逐位一致（同 YAML 跑两遍轨迹逐 bit 相同，eval 可复现），单进程直驱不起 ZMQ，训练吞吐优先
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
-- **场景生成器**：5 个确定性模板（tabletop / push / maze / race / empty），同一命令 + 同一参数 = 逐字节相同的输出
+- **场景生成器**：6 个确定性模板（tabletop / push / maze / race / pallet / empty），同一命令 + 同一参数 = 逐字节相同的输出
 - **零重量依赖**：核心只依赖 mujoco / numpy / pyyaml / pyzmq，MCP 层不依赖任何 SDK
 
 ## 安装
@@ -125,7 +126,7 @@ python -m agentsim mcp
 | `load_world` | 加载世界（`yaml_path` 或 `yaml_text` 二选一），整体替换当前世界 |
 | `run` | 推进仿真并返回摘要（ticks / success / reward / 物体终位）；`ticks=N` 只推进 N 步 |
 | `get_observation` | 当前完整观察量：qpos / qvel / ctrl / body 位置 + 传感器读数 + 任务状态 |
-| `get_robot_manifest` | 机器人设备清单：执行器、关节限位、body 名、传感器、相机 |
+| `get_robot_manifest` | 机器人设备清单：执行器、关节限位、挂点 site、body 名、传感器、相机、当前夹爪（含开合范围）+ 可用夹爪库目录 |
 | `screenshot` | 把当前状态渲染成 PNG：缺省自由机位返回 image content，`camera` 指定已声明相机，`path` 写盘 |
 | `save_state` / `load_state` | 内存快照，物理状态逐位恢复 |
 | `reset` | 世界回到 YAML 初态（重编译 + 控制器进程重启） |
@@ -146,6 +147,8 @@ python -m agentsim gui
 GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世界 YAML，后端经 stdio JSON-RPC 驱动同一个 `agentsim.mcp` 服务器——Run 时仿真跑在服务器后台线程，GUI 以 30Hz 拉取观测快照并渲染 MuJoCo 3D 画面 + 关节/物体面板。窗口里可以：
 
 - **模型库**：选 Menagerie 官方模型（首次联网下载一次）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器——点击-打开-编程闭环
+- **装备页**：选中机器人后点选即可装配/移除 OnRobot 2FG7 夹爪（UR5e/UR10e/xArm7/Panda），并按类型表单添加/删除五类传感器——所有改动写回世界 YAML 并自动重载，无需手写
+- **新建场景**（文件 → 新建场景，Ctrl+N）：选参数化模板（含码垛分区 pallet）→ 设参数 → 保存即生成并加载
 - **Load**：选择世界 YAML（解析在本地，坏文件直接报错）
 - **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
 - **停止**：run 进行中随时可点（F6）——提前收尾当前 run，控制器正常退出、已跑轨迹保留，之后照常 Reset / 继续 Run
@@ -160,6 +163,7 @@ GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世�
 python -m agentsim scenegen maze --rows 4 --cols 4 --out worlds/my_maze.yaml
 python -m agentsim scenegen race --lanes 3 --out worlds/my_race.yaml
 python -m agentsim scenegen tabletop --objects 2 --out worlds/my_table.yaml
+python -m agentsim scenegen pallet --cubes 3 --out worlds/pallet.yaml
 python -m agentsim run worlds/my_maze.yaml
 ```
 
@@ -169,6 +173,7 @@ python -m agentsim run worlds/my_maze.yaml
 | `push` | 推式任务（同 worlds/pick_cube.yaml 布局） | - |
 | `maze` | 差速车走蛇形迷宫 | `--rows` `--cols`（2~8） |
 | `race` | 多车竞速 | `--lanes`（2~3） |
+| `pallet` | 码垛分区：UR5e+2FG7 把 A 区 N 个 cube 逐个码到 B 区目标格（首次需联网下载一次 UR5e） | `--cubes`（1~6） |
 | `empty` | 空世界（配 arm / diff_car / 无机器人） | `--robot` |
 
 ## 世界文件格式
@@ -201,6 +206,8 @@ robots:
     model: ../models/demo_arm.xml   # MJCF 路径（相对本文件）
     pos: [0, 0, 0.05]               # root 绝对位姿（模型自带 pos 被吸收）
     controller: ../controllers/pick_place.py   # 控制器脚本（相对本文件）
+    gripper:                         # 可选：末端夹爪（库 key 或自定义 MJCF 路径）
+      model: onrobot_2fg7            # OnRobot 2FG7，适配四臂（见下）
     sensors:                         # 可选：五类传感器，编译进 MuJoCo
       - {name: j1_enc, type: encoder, joint: j1}          # 关节位置
       - {name: j1_tau, type: joint_torque, joint: j1}     # 关节约束力
@@ -232,6 +239,32 @@ runtime:
 - **读数进观测流**：obs 里 `sensors` 键为 `{名字: 读数}`，标量（encoder/joint_torque/tactile）是 float，IMU 是 6 维列表 `[陀螺 xyz, 加速度 xyz]`；相机不产生数值读数，只作 `screenshot` 的 viewpoint
 - **tactile 的 `radius`**：MuJoCo 3.x 的 touch 只统计接触点落在以挂点为球心、`radius` 为半径的球内的接触力——`radius` 要罩住挂点 body 的预期接触区，默认 0.06（约指尖/指板整面大小）
 - **实现映射**：encoder→JOINTPOS、joint_torque→JOINTACTFRC、imu→GYRO+ACCELEROMETER、tactile→TOUCH 标量（不是需要 plugin 的 mjSENS_TACTILE 网格阵列）；传感器是只读派生量，加不加传感器物理轨迹逐位一致（有 bit 级守护测试）
+
+## 末端夹爪装配（OnRobot 2FG7）
+
+给机器人挂夹爪有两条等价路径：
+
+1. **GUI（推荐）**：加载世界 → 右侧"装备"页 → 选机器人 → 夹爪下拉选 `OnRobot 2FG7` → "应用夹爪"；传感器也在同页表单里点选添加。改动写回世界 YAML 并自动重载。
+2. **YAML**：机器人下加 `gripper` 字段（见上例）。
+
+```yaml
+gripper:
+  model: onrobot_2fg7      # 库 key；也可写自定义 MJCF（相对世界文件的路径）
+  site: attachment_site    # 可选：挂点 site，缺省用该夹爪标定的 attachment_site
+  pos: [0, 0, 0]           # 可选：覆盖标定安装平移（米，挂点局部系）
+  quat: [1, 0, 0, 0]       # 可选：覆盖标定安装朝向（wxyz）
+```
+
+要点：
+
+- **适配机型**：`ur5e.xml` / `ur10e.xml` / `xarm7_nohand.xml` / `panda_nohand.xml` 四臂。安装位姿（mount）用同一套标定，以官方 OnRobot workbench 参考场景为黄金标准逐位校准（挂点 site → 夹爪 TCP 变换四臂一致）；未标定的机器人会报清晰错误。
+- **设备命名**：挂爪后夹爪设备带 `gripper/` 前缀并入该机器人设备索引——执行器 `gripper/gripper_act`、两滑动关节 `gripper/left_slide` / `gripper/right_slide`、body `gripper/...`。传感器可引用夹爪手指 body（如 `body: gripper/left_finger`），指尖预置了 `gripper/left_pad_site` / `gripper/right_pad_site`，TCP 为 `gripper/gripper_tcp`。
+- **开合控制**：夹爪是一个 position 执行器，`ctrlrange 0~0.038`（0 全开、0.038 闭合，两指对向耦合）：
+
+```python
+robot.set("gripper/gripper_act", 0.0)    # 张开
+robot.set("gripper/gripper_act", 0.038)  # 闭合抓取
+```
 
 ## 控制器 API（Webots 风格）
 
@@ -279,7 +312,7 @@ obs, reward, terminated, truncated, info = env.step(action)
 
 ## 机器人模型库（MuJoCo Menagerie）
 
-预配置 13 个著名机器人（`agentsim/zoo.py`）：Unitree Go1 / Go2 / H1 / G1、ANYmal C、Boston Dynamics Spot、Franka Emika Panda、UR5e、xArm7、Shadow Hand、ALOHA、Google Robot、Stretch 3——全部来自 DeepMind 官方精选模型库，经 MjSpec attach 编译进 AgentSim 世界（浮动基座四足/人形实测落地稳定）。
+预配置 14 个著名机器人（`agentsim/zoo.py`）：Unitree Go1 / Go2 / H1 / G1、ANYmal C、Boston Dynamics Spot、Franka Emika Panda、UR5e / UR10e、xArm7、Shadow Hand、ALOHA、Google Robot、Stretch 3——全部来自 DeepMind 官方精选模型库，经 MjSpec attach 编译进 AgentSim 世界（浮动基座四足/人形实测落地稳定）。
 
 **GUI 闭环**（`python -m agentsim gui`）：点"模型库"按钮 → 选模型（首次使用联网下载一次，之后永久离线）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器 → 改完控制律点 Run 重跑。
 
@@ -303,10 +336,10 @@ GUI（`python -m agentsim gui`）从可视化扩展为完整的机器人编程�
 
 ### 1. 运动演示一键播放
 
-模型库窗口选中任意机器人 → "生成演示并运行"按钮，自动生成内置运动演示并加载世界 → 自动 Run。13 个模型全部预配置运动（见 `agentsim/zoo.py`）：
+模型库窗口选中任意机器人 → "生成演示并运行"按钮，自动生成内置运动演示并加载世界 → 自动 Run。14 个模型全部预配置运动（见 `agentsim/zoo.py`）：
 
 - **四足小跑（trot）**：Unitree Go1 / Go2、ANYmal C、Boston Dynamics Spot——按对角腿相位（FL-RR / FR-RL）交替摆动；CPG 控制律 `freq`/`amp`/`lag` 在 `zoo.py` 顶部 `_trot` 工厂生成，落地即稳定行走
-- **机械臂扫掠**：Franka Panda / UR5e / xArm7——7 关节正弦相位机，base 绕 z 旋转 + 末端周期摆动
+- **机械臂扫掠**：Franka Panda / UR5e / UR10e / xArm7——7（或 6）关节正弦相位机，base 绕 z 旋转 + 末端周期摆动
 - **人形摆臂**：Unitree H1 / G1——髋膝肩肘相位差摆动模拟踏步
 - **差速车**：两轮差速车走蛇形前进
 - **静止**：Shadow Hand / ALOHA / Google Robot / Stretch 3——多指/双臂姿态展示
@@ -365,10 +398,12 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 162 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 193 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop）/传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI/
-#              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端
+#              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
+#              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
+#              码垛分区 pallet / ur10e 入库
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。M5 新增 13 项测试覆盖 demo 生成（全覆盖 + go2 600 tick 行走 >1m + panda 关节活动度）、quat 链路（attach + 欧拉↔四元数 roundtrip + 属性面板应用）、PyHighlighter 四类着色 + CodePanel 保存信号、Agent 后端（config 0600 + chat_url 兼容 + MCP↔OpenAI 工具转换 + 本地文件越界防护）。停止功能另加 5 项：内核 `stop_check` 三态（带控制器提前收尾不泄漏 / 无控制器空跑可停 / 恒 False 行为不变）、MCP stop 工具（run 中停止 + 无 run 无操作）、GUI 状态机（停止仅 RUNNING 可用）。
@@ -381,22 +416,23 @@ agentsim/
 │   ├── kernel/sim.py      # 仿真内核：ZMQ ROUTER + 栅栏同步推进
 │   ├── kernel/task.py    # 任务评估 + 观测组装纯函数（内核与 RL env 共用）
 │   ├── rl_env.py          # gymnasium.Env 包装（RL 训练接口）
-│   ├── zoo.py              # 机器人模型库（Menagerie 13 个预配置模型 + 运动演示生成器）
+│   ├── zoo.py              # 机器人模型库（Menagerie 14 个预配置模型 + 运动演示生成器）
+│   ├── grippers.py         # 夹爪库（OnRobot 2FG7：注册表/资产/四臂 mount 标定）
 │   ├── controller.py      # 控制器侧 Robot 客户端（用户唯一 API）
-│   ├── world/schema.py    # YAML → dataclass，前置校验（含 integrator / quat 字段）
-│   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译（attach 时设 integrator）
+│   ├── world/schema.py    # YAML → dataclass，前置校验（含 gripper/integrator/quat）
+│   ├── world/builder.py   # spec → MjSpec → MuJoCo 模型编译（机器人+夹爪统一装配）
 │   ├── supervisor.py      # 快照/teleport（逐位可复现）
 │   ├── mcp_server.py      # MCP stdio 服务器（零依赖 JSON-RPC）
 │   ├── render.py          # 离屏渲染 + 手写 PNG 编码（screenshot 实现层）
 │   ├── agent/             # GUI Agent 控制台后端（config/bridge/local_tools/worker）
-│   ├── gui/               # PySide6 桌面工作台（app/render_view/panels/mcp_client）
-│   ├── scene_gen.py       # 5 个确定性场景模板
+│   ├── gui/               # PySide6 桌面工作台（app/render_view/panels[含装备页]/mcp_client）
+│   ├── scene_gen.py       # 6 个确定性场景模板（含码垛分区 pallet）
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
-├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car 差速车）
+├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car）+ grippers/2FG7
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
-└── tests/                 # 162 项测试（含 M5 运动演示 / 位姿编辑 / 代码编辑器 / Agent / stop 停止）
+└── tests/                 # 193 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
 ```
 
 ## Roadmap
@@ -406,8 +442,9 @@ agentsim/
 - [x] M2 传感器系统 + MCP screenshot —— 五类传感器（encoder / IMU / 触觉 / 关节力矩 / 相机）YAML 声明进观测流，bit 级守护保证不改变物理轨迹；`screenshot` 工具让 Agent 截取仿真画面（自由机位或声明的相机机位）
 - [x] M3 RL 训练接口 —— `AgentSimEnv`（gymnasium.Env）：YAML 世界即确定性环境，动作/观测/奖励语义与内核一处实现（`kernel/task.py`），同 YAML 两遍轨迹逐位一致
 - [x] M1 心跳机制 —— 控制器 `_recv` 100ms poller 轮询 + `getppid` 孤儿检测：内核进程一死控制器必被 init/subreaper 收养（父 pid 变化），随即 `RuntimeError("内核已退出")` 退出；思考时间无限等待语义不变
-- [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（13 个预配置著名机器人），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
-- [x] M5 运动演示与智能工作台 —— 13 个模型一键运动演示（四足 trot / 机械臂扫掠 / 人形摆臂）+ GUI 位姿编辑面板（xyz+欧拉角）+ 内置 Python 代码编辑器（保存并运行）+ Agent 控制台（OpenAI 兼容 chat API 调用，AI 直接生成场景/写代码/运行验证）+ PPO 训练示例（`examples/train_ppo_go2.py`）
+- [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（14 个预配置著名机器人，M6 新增 UR10e），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
+- [x] M5 运动演示与智能工作台 —— 14 个模型一键运动演示（四足 trot / 机械臂扫掠 / 人形摆臂）+ GUI 位姿编辑面板（xyz+欧拉角）+ 内置 Python 代码编辑器（保存并运行）+ Agent 控制台（OpenAI 兼容 chat API 调用，AI 直接生成场景/写代码/运行验证）+ PPO 训练示例（`examples/train_ppo_go2.py`）
+- [x] M6 夹具/传感器装配工作台 —— OnRobot 2FG7 夹爪入库（site-attach 到 UR5e/UR10e/xArm7/Panda，mount 对四臂统一标定并与官方参考场景逐位吻合）+ GUI"装备"页一键挂爪/拆爪与五类传感器表单式增删（自动改 YAML 重载）+ 码垛分区场景模板 pallet（UR5e+2FG7，A 区取料→B 区码放，IK 验证全部取放点可达）+ GUI"新建场景"对话框 + UR10e 入库
 
 ## 已知取舍（M0）
 

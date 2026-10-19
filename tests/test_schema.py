@@ -126,3 +126,51 @@ class TestSchemaErrors:
 class TestHexColor:
     def test_hex_to_rgba(self):
         assert hex_to_rgba("#FF8000") == [1.0, 0.502, 0.0, 1.0]
+
+
+class TestGripperParsing:
+    """M6：RobotSpec.gripper 的 YAML 解析（不含物理，物理见 test_grippers）。"""
+
+    def _robot(self, gripper=None):
+        d = _base()
+        r = {"name": "arm", "model": "x.xml"}
+        if gripper is not None:
+            r["gripper"] = gripper
+        d["robots"] = [r]
+        return parse_world(d).robots[0]
+
+    def test_no_gripper_defaults_none(self):
+        assert self._robot().gripper is None
+
+    def test_gripper_full_fields(self):
+        g = self._robot({
+            "model": "onrobot_2fg7", "site": "attachment_site",
+            "pos": [0, 0, 0.1], "quat": [0, 1, 0, 0]}).gripper
+        assert g is not None
+        assert g.model == "onrobot_2fg7"
+        assert g.site == "attachment_site"
+        assert g.pos == (0.0, 0.0, 0.1)
+        assert g.quat == (0.0, 1.0, 0.0, 0.0)
+
+    def test_gripper_model_only(self):
+        g = self._robot({"model": "onrobot_2fg7"}).gripper
+        assert g.model == "onrobot_2fg7" and g.site is None
+        assert g.pos is None and g.quat is None
+
+    def test_gripper_must_be_dict(self):
+        with pytest.raises(WorldError) as e:
+            self._robot("onrobot_2fg7")
+        assert "gripper" in str(e.value)
+
+    def test_gripper_missing_model(self):
+        with pytest.raises(WorldError) as e:
+            self._robot({"site": "attachment_site"})
+        assert "model" in str(e.value)
+
+    def test_gripper_bad_vec(self):
+        with pytest.raises(WorldError) as e:
+            self._robot({"model": "g", "pos": [0, 0]})
+        assert "pos" in str(e.value)
+        with pytest.raises(WorldError) as e:
+            self._robot({"model": "g", "quat": [1, 0, 0]})
+        assert "quat" in str(e.value)

@@ -81,6 +81,21 @@ class SensorSpec:
 
 
 @dataclass
+class GripperSpec:
+    """末端夹爪声明：经 site-attach 挂到机器人腕部挂点。
+
+    model：夹爪库 key（如 onrobot_2fg7）或 MJCF 路径（相对世界文件）。
+    site：挂到机器人的哪个 body site，缺省由夹爪库给定（attachment_site）。
+    pos/quat：一般不写——builder 用 grippers.py 里按机器人模型标定的 mount
+    变换；显式写则覆盖 mount 表（非标准臂/手动微调）。
+    """
+    model: str
+    site: str | None = None
+    pos: tuple[float, float, float] | None = None
+    quat: tuple[float, float, float, float] | None = None
+
+
+@dataclass
 class RobotSpec:
     name: str
     model: str                      # MJCF 路径（相对世界文件）
@@ -90,6 +105,7 @@ class RobotSpec:
     controller: str | None = None   # 控制器脚本路径（相对世界文件）
     args: dict = field(default_factory=dict)
     sensors: list[SensorSpec] = field(default_factory=list)
+    gripper: GripperSpec | None = None
 
 
 @dataclass
@@ -330,9 +346,29 @@ def _parse_robots(d, path: str, seen: dict) -> list[RobotSpec]:
         if not isinstance(args, dict):
             raise _err(f"{p}.args", f"需要字典，实际是: {args!r}")
         sensors = _parse_sensors(rd, p)
+        gripper = _parse_gripper(rd.get("gripper"), f"{p}.gripper")
         robots.append(RobotSpec(name=name, model=model, pos=pos, quat=quat,
-                                controller=controller, args=args, sensors=sensors))
+                                controller=controller, args=args,
+                                sensors=sensors, gripper=gripper))
     return robots
+
+
+def _parse_gripper(gd, path: str) -> "GripperSpec | None":
+    if gd is None:
+        return None
+    if not isinstance(gd, dict):
+        raise _err(path, f"需要字典（model/site/pos/quat），实际是: {gd!r}")
+    model = _str(_req(gd, "model", path), f"{path}.model")
+    site = gd.get("site")
+    if site is not None:
+        site = _str(site, f"{path}.site")
+    gpos = gd.get("pos")
+    gquat = gd.get("quat")
+    if gpos is not None:
+        gpos = _vec(gpos, 3, f"{path}.pos")
+    if gquat is not None:
+        gquat = _vec(gquat, 4, f"{path}.quat")
+    return GripperSpec(model=model, site=site, pos=gpos, quat=gquat)
 
 
 def _parse_zone(d, path: str) -> ZoneSpec:

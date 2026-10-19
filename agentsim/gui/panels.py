@@ -18,9 +18,9 @@ from PySide6.QtGui import (QColor, QFont, QKeySequence, QShortcut,
                            QSyntaxHighlighter, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPlainTextEdit, QPushButton,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+                               QLineEdit, QListWidget, QPlainTextEdit,
+                               QPushButton, QStackedWidget, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from agentsim.gui import theme
 
@@ -797,3 +797,262 @@ class AgentConfigDialog(QDialog):
         return AgentConfig(base_url=self.ed_url.text().strip(),
                            api_key=self.ed_key.text().strip(),
                            model=self.ed_model.text().strip())
+
+
+class GearPanel(QWidget):
+    """装备面板：机器人下拉 + 夹爪配置 + 传感器列表/新增/删除。
+
+    信号：apply_gripper/remove_gripper/add_sensor/remove_sensor
+    """
+    apply_gripper = Signal(str, object)   # robot_name, gripper_dict | None
+    add_sensor = Signal(str, object)      # robot_name, sensor_dict
+    remove_sensor = Signal(str, str)      # robot_name, sensor_name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._base_dir = None
+        self._manifest = None
+        self._sensor_types = ["encoder", "imu", "tactile", "joint_torque", "camera"]
+
+        lay = QVBoxLayout(self)
+        # 机器人选择
+        self._robot_row = QHBoxLayout()
+        self._robot_row.addWidget(QLabel("选择机器人："))
+        self._robot_combo = QComboBox()
+        self._robot_combo.currentIndexChanged.connect(self._on_robot_changed)
+        self._robot_row.addWidget(self._robot_combo)
+        self._robot_row.addStretch()
+        lay.addLayout(self._robot_row)
+
+        # 夹爪组
+        self._gripper_box = QGroupBox("末端夹爪")
+        gripper_lay = QFormLayout(self._gripper_box)
+        self._gripper_combo = QComboBox()
+        self._gripper_combo.addItem("（无夹爪）", None)
+        self._gripper_combo.currentIndexChanged.connect(self._on_gripper_changed)
+        gripper_lay.addRow("夹爪：", self._gripper_combo)
+
+        self._site_combo = QComboBox()
+        self._site_combo.setPlaceholderText("attachment_site（自动）")
+        gripper_lay.addRow("挂点：", self._site_combo)
+
+        self._pos_spins = [QDoubleSpinBox() for _ in range(3)]
+        pos_row = QHBoxLayout()
+        pos_row.addWidget(QLabel("x:"))
+        for i in range(3):
+            s = self._pos_spins[i]
+            s.setRange(-20.0, 20.0); s.setDecimals(3); s.setSingleStep(0.01)
+            pos_row.addWidget(s)
+        gripper_lay.addRow("pos:", pos_row)
+
+        self._rot_spins = [QDoubleSpinBox() for _ in range(3)]
+        rot_row = QHBoxLayout()
+        for i in range(3):
+            s = self._rot_spins[i]
+            s.setRange(-180.0, 180.0); s.setDecimals(1); s.setSingleStep(5.0)
+            rot_row.addWidget(s)
+        rot_row.addWidget(QLabel("（roll/pitch/yaw deg）"))
+        gripper_lay.addRow("rot:", rot_row)
+
+        self._bt_apply_gripper = QPushButton("应用夹爪")
+        self._bt_apply_gripper.clicked.connect(self._on_apply_gripper)
+        self._bt_remove_gripper = QPushButton("移除夹爪")
+        self._bt_remove_gripper.clicked.connect(self._on_remove_gripper)
+        gripper_btn_row = QHBoxLayout()
+        gripper_btn_row.addStretch()
+        gripper_btn_row.addWidget(self._bt_remove_gripper)
+        gripper_btn_row.addWidget(self._bt_apply_gripper)
+        gripper_lay.addRow("", gripper_btn_row)
+        lay.addWidget(self._gripper_box)
+
+        # 传感器组
+        self._sensor_box = QGroupBox("传感器")
+        sensor_lay = QVBoxLayout(self._sensor_box)
+        self._sensor_list = QListWidget()
+        sensor_lay.addWidget(self._sensor_list)
+
+        self._bt_del_sensor = QPushButton("删除选中传感器")
+        self._bt_del_sensor.clicked.connect(self._on_remove_sensor)
+        sensor_lay.addWidget(self._bt_del_sensor)
+
+        # 新增传感器表单
+        self._add_box = QGroupBox("新增传感器")
+        add_lay = QFormLayout(self._add_box)
+        self._sensor_type = QComboBox()
+        self._sensor_type.addItems(self._sensor_types)
+        self._sensor_type.currentIndexChanged.connect(self._on_sensor_type_changed)
+        add_lay.addRow("类型：", self._sensor_type)
+        self._sensor_name = QLineEdit()
+        self._sensor_name.setPlaceholderText("如 \"left_touch\"")
+        add_lay.addRow("名称：", self._sensor_name)
+
+        self._ref_label = QLabel("引用关节：")
+        self._ref_stack = QStackedWidget()
+        self._ref_joint = QComboBox()
+        self._ref_body = QComboBox()
+        self._ref_stack.addWidget(self._ref_joint)   # 页 0：关节
+        self._ref_stack.addWidget(self._ref_body)    # 页 1：body
+        add_lay.addRow(self._ref_label, self._ref_stack)
+
+        pos_row_add = QHBoxLayout()
+        self._pos_spins_add = [QDoubleSpinBox() for _ in range(3)]
+        for s in self._pos_spins_add:
+            s.setRange(-20.0, 20.0); s.setDecimals(3); s.setSingleStep(0.01)
+            pos_row_add.addWidget(s)
+        add_lay.addRow("pos:", pos_row_add)
+
+        self._quat_label = QLabel("quat (wxyz):")
+        self._quat_spins_add = [QDoubleSpinBox() for _ in range(4)]
+        quat_row_add = QHBoxLayout()
+        self._quat_spins_add[0].setValue(1.0)
+        for s in self._quat_spins_add:
+            s.setRange(-1.0, 1.0); s.setDecimals(4); s.setSingleStep(0.05)
+            quat_row_add.addWidget(s)
+        add_lay.addRow(self._quat_label, quat_row_add)
+
+        self._radius_label = QLabel("radius (m):")
+        self._radius_spin = QDoubleSpinBox()
+        self._radius_spin.setRange(0.001, 1.0); self._radius_spin.setDecimals(3)
+        self._radius_spin.setSingleStep(0.01); self._radius_spin.setValue(0.06)
+        add_lay.addRow(self._radius_label, self._radius_spin)
+
+        self._bt_add_sensor = QPushButton("新增")
+        self._bt_add_sensor.clicked.connect(self._on_add_sensor)
+        add_btn_row = QHBoxLayout()
+        add_btn_row.addStretch(); add_btn_row.addWidget(self._bt_add_sensor)
+        add_lay.addRow("", add_btn_row)
+        sensor_lay.addWidget(self._add_box)
+
+        lay.addWidget(self._sensor_box)
+        lay.addStretch()
+
+        self._clear()
+
+    def set_manifest(self, manifest: dict, base_dir: str):
+        self._manifest = manifest
+        self._base_dir = base_dir
+        self._robot_combo.clear()
+        for r in manifest.get("robots", []):
+            self._robot_combo.addItem(r["name"], r)
+        self._on_robot_changed()
+
+    def _clear(self):
+        self._robot_combo.clear()
+        self._gripper_combo.clear()
+        self._site_combo.clear()
+        self._sensor_list.clear()
+        self._ref_joint.clear()
+        self._ref_body.clear()
+
+    def _current_robot(self) -> dict | None:
+        return self._robot_combo.currentData()
+
+    def _current_gripper_catalog(self) -> dict:
+        return {g["key"]: g for g in self._manifest.get("gripper_catalog", [])}
+
+    def _on_robot_changed(self):
+        r = self._current_robot()
+        self._gripper_box.setEnabled(r is not None)
+        self._sensor_box.setEnabled(r is not None)
+        if r is None:
+            return
+        # 填充夹爪目录
+        gc = self._current_gripper_catalog()
+        self._gripper_combo.clear()
+        self._gripper_combo.addItem("（无夹爪）", None)
+        for k, gi in gc.items():
+            self._gripper_combo.addItem(gi["title"], k)
+        # 预填当前夹爪（如果有）
+        curr_g = r.get("gripper")
+        if curr_g is not None:
+            idx = self._gripper_combo.findData(curr_g["model"])
+            if idx >= 0:
+                self._gripper_combo.setCurrentIndex(idx)
+        # 挂点下拉
+        self._site_combo.clear()
+        self._site_combo.addItem("attachment_site（自动）", None)
+        for s in r.get("sites", []):
+            self._site_combo.addItem(s, s)
+        # 传感器列表
+        self._sensor_list.clear()
+        for s in r.get("sensors", []):
+            self._sensor_list.addItem(f"{s['name']} ({s['type']})")
+        # 关节/body 下拉
+        self._ref_joint.clear()
+        self._ref_body.clear()
+        for j in r.get("joints", []):
+            self._ref_joint.addItem(j["name"])
+        for short in r.get("bodies", {}).values():
+            self._ref_body.addItem(short)
+        self._on_sensor_type_changed()
+
+    def _on_sensor_type_changed(self):
+        t = self._sensor_type.currentText()
+        is_joint_sensor = t in ("encoder", "joint_torque")
+        self._ref_label.setText("引用关节：" if is_joint_sensor else "引用 body：")
+        self._ref_stack.setCurrentIndex(0 if is_joint_sensor else 1)
+        # 显示/隐藏 quat/radius
+        self._quat_label.setVisible(t == "camera")
+        for s in self._quat_spins_add:
+            s.setVisible(t == "camera")
+        self._radius_label.setVisible(t == "tactile")
+        self._radius_spin.setVisible(t == "tactile")
+
+    def _on_gripper_changed(self):
+        self._bt_apply_gripper.setEnabled(self._gripper_combo.currentData() is not None)
+        # 如果选了 catalog 夹爪，自动选挂点为 None（自动 attachment_site）
+        self._site_combo.setCurrentIndex(0)
+
+    def _on_apply_gripper(self):
+        r = self._current_robot()
+        k = self._gripper_combo.currentData()
+        if r is None or k is None:
+            return
+        gd = {"model": k}
+        site = self._site_combo.currentData()
+        if site is not None:
+            gd["site"] = site
+        pos = tuple(round(s.value(), 4) for s in self._pos_spins)
+        if pos != (0.0, 0.0, 0.0):
+            gd["pos"] = list(pos)
+        quat = tuple(round(s.value(), 4) for s in self._rot_spins)
+        if quat != (0.0, 0.0, 0.0):
+            gd["quat"] = list(euler_to_quat(*quat))
+        self.apply_gripper.emit(r["name"], gd)
+
+    def _on_remove_gripper(self):
+        r = self._current_robot()
+        if r is not None:
+            self.apply_gripper.emit(r["name"], None)
+
+    def _on_add_sensor(self):
+        r = self._current_robot()
+        name = self._sensor_name.text().strip()
+        typ = self._sensor_type.currentText()
+        if r is None or not name or not typ:
+            return
+        sd = {"name": name, "type": typ}
+        if typ in ("encoder", "joint_torque"):
+            sd["joint"] = self._ref_joint.currentText()
+        else:
+            sd["body"] = self._ref_body.currentText()
+        pos = [round(s.value(), 4) for s in self._pos_spins_add]
+        if pos != [0.0, 0.0, 0.0]:
+            sd["pos"] = pos
+        if typ == "camera":
+            quat = [round(s.value(), 4) for s in self._quat_spins_add]
+            if quat != [1.0, 0.0, 0.0, 0.0]:
+                sd["quat"] = quat
+        if typ == "tactile":
+            sd["radius"] = round(self._radius_spin.value(), 4)
+        self.add_sensor.emit(r["name"], sd)
+        self._sensor_name.clear()
+
+    def _on_remove_sensor(self):
+        r = self._current_robot()
+        item = self._sensor_list.currentItem()
+        if r and item:
+            # 解析出传感器名（"name (type)"）
+            txt = item.text()
+            name = txt.split()[0]
+            self.remove_sensor.emit(r["name"], name)

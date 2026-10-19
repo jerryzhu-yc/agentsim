@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 import mujoco
 
 from agentsim.errors import WorldError
+from agentsim.grippers import (GRIPPER_PREFIX, GRIPPERS, ensure_gripper,
+                               gripper_info, mount_for)
 from agentsim.world.schema import (
     WorldSpec, RobotSpec, SensorSpec, TaskSpec, DistanceReward, ZoneReward,
     ContactReward, hex_to_rgba,
@@ -249,15 +251,73 @@ def _ensure_actuator_names(child: mujoco.MjSpec) -> list[str]:
     return names
 
 
-def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
+def _load_gripper_xml(gmodel: str, spec: WorldSpec) -> pathlib.Path:
+    """夹爪 model 字段 -> MJCF 路径：夹爪库 key 优先，否则按世界相对路径。"""
+    if gmodel in GRIPPERS:
+        return ensure_gripper(gmodel)
+    return _resolve_path(spec.base_dir, gmodel, "夹爪模型")
+
+
+def _assemble_robot_child(spec: WorldSpec,
+                          robot: RobotSpec) -> tuple[mujoco.MjSpec, list[str]]:
+    """装配单台机器人的合并 MjSpec（机器人本体 + 可选夹爪 + 传感器）。
+
+    统一入口：attach 到世界（_attach_robot）与建设备索引
+    （_child_actuator_names/_child_joint_names）都调它，保证三处看到的
+    是同一份装配结果，不再各自重新 load。
+
+    顺序很关键：先挂夹爪（site-attach 到腕部），再注入传感器——这样触觉
+    传感器可以引用夹爪手指 body（body 名以 "gripper/" 开头）。
+    返回 (合并后的 child spec, 全部执行器短名列表)。
+    """
     model_path = _resolve_path(spec.base_dir, robot.model, "机器人模型")
     try:
         child = mujoco.MjSpec.from_file(str(model_path))
     except Exception as e:
-        raise WorldError(f"机器人 '{robot.name}' 模型解析失败 ({model_path}): {e}") from e
+        raise WorldError(
+            f"机器人 '{robot.name}' 模型解析失败 ({model_path}): {e}") from e
 
-    _add_child_sensors(robot, child)
-    _ensure_actuator_names(child)          # 无名执行器补名（attach 前改名才存活）
+    # ---- 夹爪 site-attach 到机器人腕部挂点 ----
+    if robot.gripper is not None:
+        g = robot.gripper
+        grip_path = _load_gripper_xml(g.model, spec)
+        try:
+            grip = mujoco.MjSpec.from_file(str(grip_path))
+        except Exception as e:
+            raise WorldError(
+                f"机器人 '{robot.name}' 的夹爪解析失败 ({grip_path}): {e}") from e
+        if g.site is not None:
+            site_name = g.site
+        elif g.model in GRIPPERS:
+            site_name = gripper_info(g.model)["site"]
+        else:                              # 自定义 MJCF 路径：menagerie 惯例挂点名
+            site_name = "attachment_site"
+        site_names = {s.name for s in child.sites}
+        if site_name not in site_names:
+            raise WorldError(
+                f"机器人 '{robot.name}' 模型里没有挂点 site '{site_name}'，"
+                f"可用: {sorted(site_names)}（夹爪 {g.model}）")
+        if g.model in GRIPPERS:
+            xf = mount_for(g.model, robot.model, g.pos, g.quat)
+        elif g.pos is None or g.quat is None:
+            raise WorldError(
+                f"自定义夹爪 '{g.model}' 不在夹爪库、无标定 mount，必须在 "
+                f"gripper 下同时显式写 pos 与 quat 指定相对挂点 '{site_name}' "
+                f"的安装变换（库内夹爪则自动标定）")
+        else:
+            xf = {"pos": list(g.pos), "quat": list(g.quat)}
+        try:
+            grip_frame = child.attach(grip, site=site_name,
+                                      prefix=GRIPPER_PREFIX)
+        except Exception as e:
+            raise WorldError(
+                f"机器人 '{robot.name}' 挂载夹爪 '{g.model}' 失败: {e}") from e
+        grip_frame.pos[:] = list(xf["pos"])
+        grip_frame.quat[:] = list(xf["quat"])
+
+    _add_child_sensors(robot, child)          # 在合并 spec 上注入（触觉可挂手指）
+    act_names = _ensure_actuator_names(child)  # 无名执行器补名（attach 前改名才存活）
+
     # root body 自带 pos/quat 清零：spec.pos/quat 必须是机器人 root 的绝对世界
     # 位姿，否则 menagerie 四足（trunk 自带 0.445 高度）会被叠加出生到 0.9m
     # 高空——GUI 拖动回写位姿也因此不幂等
@@ -265,6 +325,11 @@ def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
         if b.parent is child.worldbody:
             b.pos[:] = [0.0, 0.0, 0.0]
             b.quat[:] = [1.0, 0.0, 0.0, 0.0]
+    return child, act_names
+
+
+def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:
+    child, _ = _assemble_robot_child(spec, robot)
     frame = mj.worldbody.add_frame(
         name=f"{robot.name}_frame", pos=list(robot.pos),
         quat=list(robot.quat) if robot.quat else None)
@@ -339,24 +404,22 @@ def _build_index(model: mujoco.MjModel, spec: WorldSpec) -> NameIndex:
 
 
 def _child_actuator_names(spec: WorldSpec, rd: RobotSpec) -> list[str]:
-    """从机器人的 MJCF 里读取执行器原始名（无前缀），供索引解析。
+    """读取装配后（含夹爪）全部执行器名（机器人前缀之外的短名），供索引解析。
 
-    与 _attach_robot 同一套补名逻辑（确定性一致），无名执行器不会丢。
+    与 _attach_robot 走同一个 _assemble_robot_child，补名/夹爪 prefix
+    确定性一致，夹爪执行器（gripper/gripper_act）自动并入。
     """
-    model_path = _resolve_path(spec.base_dir, rd.model, "机器人模型")
-    child = mujoco.MjSpec.from_file(str(model_path))
-    names = _ensure_actuator_names(child)
+    _, names = _assemble_robot_child(spec, rd)
     if not names:
         raise WorldError(
-            f"机器人 '{rd.name}' 模型里没有任何执行器 ({model_path})，"
+            f"机器人 '{rd.name}' 模型里没有任何执行器 ({rd.model})，"
             f"无法建立设备索引")
     return names
 
 
 def _child_joint_names(spec: WorldSpec, rd: RobotSpec) -> list[str]:
-    """从机器人的 MJCF 里读取关节原始名（无前缀）。"""
-    model_path = _resolve_path(spec.base_dir, rd.model, "机器人模型")
-    child = mujoco.MjSpec.from_file(str(model_path))
+    """读取装配后（含夹爪）全部关节名（机器人前缀之外的短名）。"""
+    child, _ = _assemble_robot_child(spec, rd)
     return [j.name for j in child.joints if j.name]
 
 

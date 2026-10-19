@@ -219,6 +219,11 @@ MODELS: dict[str, dict] = {
         "title": "Universal Robots UR5e", "cat": "机械臂", "xml": "ur5e.xml",
         "pos": [0, 0, 0], "desc": "UR5e 6 轴协作臂",
         "demo": _osc(sweep_frac=0.4)},
+    "universal_robots_ur10e": {
+        "title": "Universal Robots UR10e", "cat": "机械臂", "xml": "ur10e.xml",
+        "pos": [0, 0, 0], "desc": "UR10e 6 轴协作臂（负载/臂展大于 UR5e，"
+                                  "可挂 OnRobot 2FG7 夹爪）",
+        "demo": _osc(sweep_frac=0.4)},
     "ufactory_xarm7": {
         "title": "UFACTORY xArm7", "cat": "机械臂", "xml": "xarm7_nohand.xml",
         "pos": [0, 0, 0], "desc": "xArm7 7 轴臂（含手变体 xarm7.xml）",

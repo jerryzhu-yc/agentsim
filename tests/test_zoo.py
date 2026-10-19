@@ -115,9 +115,9 @@ def test_zoo_dialog_offscreen(qapp):
 # ================================================================ M5-P1 运动演示
 
 def test_demo_config_full_coverage():
-    """T1：13 模型全部带 demo 配置，kind/字段完整（纯离线，零缓存依赖）。"""
+    """T1：模型库全部带 demo 配置，kind/字段完整（纯离线，零缓存依赖）。"""
     from agentsim.zoo import MODELS
-    assert len(MODELS) == 13
+    assert len(MODELS) >= 13               # 13 基线 + M6 起新增 ur10e
     assert all(m.get("demo") for m in MODELS.values())
     kinds = {m["demo"]["kind"] for m in MODELS.values()}
     assert kinds <= {"trot", "osc", "balance"}
@@ -191,6 +191,42 @@ def test_demo_panda_moves(tmp_path):
         obs = s.call_tool("get_observation", {})
         q0 = obs0["robots"]["franka_emika_panda"]["qpos"]
         q1 = obs["robots"]["franka_emika_panda"]["qpos"]
+        dq = max(abs(a - b) for a, b in zip(q0, q1))
+        assert dq > 0.1, f"关节最大变化 {dq:.3f} rad，未在运动"
+    finally:
+        s.close()
+
+
+def _cached_path(key: str, xml: str) -> bool:
+    """files() 清单可能滞后，解压目录存在也算缓存命中。"""
+    import glob as _glob
+    if _cached(key, xml):
+        return True
+    return bool(_glob.glob(
+        os.path.expanduser(
+            f"~/.cache/mujoco_menagerie/models/{key}-*/{xml}")))
+
+
+@pytest.mark.skipif(not _cached_path("universal_robots_ur10e", "ur10e.xml"),
+                    reason="ur10e 未缓存（首次使用需网络下载）")
+def test_demo_ur10e_registered_and_moves(tmp_path):
+    """M6：ur10e 入库——可生成 demo 且 6 关节扫掠运动，零 crash。"""
+    from agentsim.zoo import MODELS, generate
+    from agentsim.mcp_server import AgentSimSession
+    assert "universal_robots_ur10e" in MODELS
+    assert MODELS["universal_robots_ur10e"]["xml"] == "ur10e.xml"
+
+    r = generate("universal_robots_ur10e", out_dir=tmp_path / "u", demo=True)
+    s = AgentSimSession()
+    try:
+        s.call_tool("load_world", {"yaml_path": r["world"]})
+        obs0 = s.call_tool("get_observation", {})
+        stats = s.call_tool("run", {"ticks": 200})
+        assert stats["ticks"] == 200 and stats["crashed"] == []
+        obs = s.call_tool("get_observation", {})
+        q0 = obs0["robots"]["universal_robots_ur10e"]["qpos"]
+        q1 = obs["robots"]["universal_robots_ur10e"]["qpos"]
+        assert len(q0) == 6                      # UR10e 6 轴
         dq = max(abs(a - b) for a, b in zip(q0, q1))
         assert dq > 0.1, f"关节最大变化 {dq:.3f} rad，未在运动"
     finally:

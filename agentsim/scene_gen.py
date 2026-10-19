@@ -212,6 +212,63 @@ def _tpl_empty(p, base):
     return _base_world(f"empty_{kind}", [], robots)
 
 
+def _tpl_pallet(p, base):
+    """码垛分区：UR5e + 2FG7 把 A 区一排 cube 逐个码到 B 区对应目标格。
+
+    布局（臂装在桌后缘，坐标系对齐官方 workbench 参考场景）：
+    - 桌面顶 z=0.75，臂固定基座在桌后缘 (0,0,0.75)
+    - A 区（取料）x=0.62，cube 沿 y 居中排开
+    - B 区（放料）x=0.30，每个 cube 一个目标 zone（绿色垫板标记）
+    """
+    n = p["cubes"]
+    _check_range("cubes", n, 1, 6)
+    from agentsim.zoo import ensure_model   # 懒加载：首次触发 menagerie 下载
+
+    top_z = 0.75
+    half, cs, gap = 0.025, 0.025, 0.11      # cube 半边长 / 目标格间距
+    x_a, x_b = 0.62, 0.30
+
+    def yi(i):
+        return round((i - (n - 1) / 2.0) * gap, 4)
+
+    objects = [
+        # 工作台（顶 z=0.75）
+        _obj("table", (0.40, 0.40, 0.03), (0.45, 0, top_z - 0.03),
+             "#6B7280", static=True),
+    ]
+    zones = []
+    for i in range(n):
+        y = yi(i)
+        # A 区待抓 cube
+        objects.append(_obj(f"cube_{i}", (half, half, half),
+                            (x_a, y, top_z + cs), "#F59E0B",
+                            mass=0.05, friction=1.0))
+        # B 区目标垫板（静态薄板，纯视觉标记）
+        objects.append(_obj(f"pad_{i}", (0.045, 0.045, 0.002),
+                            (x_b, y, top_z + 0.002), "#10B981",
+                            static=True))
+        zones.append({"min": [x_b - 0.05, y - 0.05, top_z],
+                      "max": [x_b + 0.05, y + 0.05, top_z + 0.15]})
+
+    task = {
+        "success": {"body": "cube_0", "zone": zones[0]},
+        "reward": [{"zone": {"body": f"cube_{i}", "zone": zones[i],
+                             "weight": 0.01}} for i in range(n)],
+        "max_ticks": 8000,
+    }
+    arm = {
+        "name": "arm",
+        "model": str(ensure_model("universal_robots_ur5e")),
+        "pos": [0, 0, top_z],
+        "gripper": {"model": "onrobot_2fg7"},
+    }
+    w = _base_world(f"pallet_{n}", objects, [arm], task)
+    w["integrator"] = "implicitfast"
+    w["impratio"] = 100
+    w["scene"]["floor"]["size"] = [1.5, 1.5]
+    return w
+
+
 # name -> (说明, {参数: (类型, 默认, 范围/取值说明)}, 构建函数)
 TEMPLATES = {
     "tabletop": ("机械臂桌面抓取：桌面 + N 个 cube + 抬升成功区",
@@ -223,6 +280,8 @@ TEMPLATES = {
               "cols": (int, 4, "列数 2~8")}, _tpl_maze),
     "race": ("多车竞速：并行车道 + 终点区",
              {"lanes": (int, 2, "车道数 2~3")}, _tpl_race),
+    "pallet": ("码垛分区：UR5e+2FG7 把 A 区 cube 逐个码到 B 区目标格",
+               {"cubes": (int, 3, "cube 数 1~6")}, _tpl_pallet),
     "empty": ("空世界：地面 + 可选机器人，任务留给 Agent",
               {"robot": (str, "arm", "arm | diff_car | none")}, _tpl_empty),
 }
