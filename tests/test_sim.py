@@ -3,6 +3,7 @@
 控制器脚本由测试动态生成（tmp_path），走真实子进程 + ZMQ 路径。
 """
 import pathlib
+import subprocess
 
 import mujoco
 import numpy as np
@@ -143,3 +144,43 @@ class TestNoController:
             stats = sim.run(max_ticks=50)
         assert stats["ticks"] == 50
         assert not stats["nan"]
+
+
+class TestStop:
+    """stop_check：GUI 停止按钮 / MCP stop 工具的内核层。"""
+
+    def test_stop_check_premature_finish_with_controller(self, tmp_path):
+        """带控制器的世界：stop_check 为真时提前收尾——控制器进程随 stop
+        正常退出（不泄漏、不算崩溃），已跑 tick 数小于上限"""
+        ctrl_path = _write_controller(tmp_path, """
+from agentsim.controller import Robot
+robot = Robot()
+while robot.step():
+    robot.set("a1", 0.3)
+""")
+        spec = parse_world(_world_dict(ctrl_path))
+        with Simulation(spec) as sim:
+            stats = sim.run(max_ticks=500, stop_check=lambda: sim.tick >= 5)
+        assert 5 <= stats["ticks"] < 500     # 提前收尾且至少推进了几 tick
+        assert stats["crashed"] == []        # 停止收尾不是崩溃
+        assert not stats["nan"]
+        proc = sim._procs["arm"]             # 控制器毫秒级退出（无泄漏）
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("停止后控制器未在 3s 内退出（泄漏）")
+
+    def test_stop_check_no_controller_world(self):
+        """无控制器世界：stop_check 同样生效（空跑循环也要能停）"""
+        spec = parse_world(_world_dict(None))
+        with Simulation(spec) as sim:
+            stats = sim.run(max_ticks=10000, stop_check=lambda: sim.tick >= 7)
+        assert 7 <= stats["ticks"] < 10000
+        assert not stats["nan"]
+
+    def test_stop_check_never_true_runs_to_end(self):
+        """stop_check 恒 False：行为与不传完全一致（跑满）"""
+        spec = parse_world(_world_dict(None))
+        with Simulation(spec) as sim:
+            stats = sim.run(max_ticks=20, stop_check=lambda: False)
+        assert stats["ticks"] == 20

@@ -49,6 +49,49 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Windows 部署
+
+AgentSim 全链路 Windows 兼容：内核用 `tcp://127.0.0.1` 随机端口（无 `ipc://`，Windows 不支持）；控制器子进程走 `subprocess.Popen` + `sys.executable`（无 fork）；渲染后端代码已平台自适应——**Linux/macOS 默认 EGL，Windows 默认 wgl**（`mcp_server.py` / `gui/__init__.py` 里的 `setdefault`，用户可用环境变量 `MUJOCO_GL` 覆盖）。零配置，照下面做即可：
+
+**1. 装 Python 3.10+**（python.org 安装包勾选 "Add python.exe to PATH"，或 [Miniconda](https://docs.conda.io/en/latest/miniconda.html)）
+
+**2. 克隆 + 装依赖**（PowerShell 或 CMD）：
+
+```powershell
+git clone https://github.com/jerryzhu-yc/agentsim.git
+cd agentsim
+python -m venv .venv
+.venv\Scripts\activate          # PowerShell 若报执行策略错误见下方 FAQ
+pip install -r requirements.txt
+```
+
+所有依赖（mujoco / PySide6 / pyzmq / numpy）在 Windows 均有官方预编译 wheel，无需编译器。
+
+**3. 验证安装**：
+
+```powershell
+python -m pytest tests/ -q      # 全绿即环境就绪（含 GUI/传感器/RL 全量回归）
+python -m agentsim run worlds/pick_cube.yaml     # 跑一个内置任务
+python -m agentsim gui                            # 桌面工作台
+```
+
+**Windows 常见问题（FAQ）**：
+
+| 现象 | 处理 |
+|---|---|
+| PowerShell 激活 venv 报 "禁止运行脚本" | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 后重试，或改用 CMD |
+| 首次运行弹 Windows 防火墙提示 | 点"允许"——内核 ZMQ 只绑 `127.0.0.1` 本机回环，不对外通信 |
+| 远程桌面（RDP）断开后 GUI 崩溃 | RDP 会话的 GPU 上下文随会话注销销毁；用控制台会话（`qwinsta` 抢 session 1）或无 GUI 的 `python -m agentsim run` |
+| 渲染报 `wgl` 相关错误（无 GPU 的服务器） | Windows Server 无 OpenGL 驱动，装 [Mesa3D 离屏驱动](https://mesa3d.org/)（或设 `MUJOCO_GL=osmesa`），或改用 Linux 容器跑无头测试 |
+| `mujoco-menagerie` 模型首次下载慢/失败 | 模型资产由 `mujoco-menagerie` 包从 GitHub 下载到 `~/.cache/mujoco_menagerie/`；网络受限时配代理（`HTTPS_PROXY` 环境变量），或先在有网机器上下载后拷贝缓存目录 |
+| 中文/空格路径 | 完全支持（pathlib 全程处理），但建议路径不含空格避免个别工具链问题 |
+
+**可选依赖**（都是 `pip install`，Windows 同样直接装）：
+
+```powershell
+pip install stable-baselines3   # RL 训练示例（examples/train_ppo_go2.py）
+```
+
 ## 快速开始
 
 ### 1. 跑一个内置任务（人类用户）
@@ -105,6 +148,7 @@ GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世�
 - **模型库**：选 Menagerie 官方模型（首次联网下载一次）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器——点击-打开-编程闭环
 - **Load**：选择世界 YAML（解析在本地，坏文件直接报错）
 - **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
+- **停止**：run 进行中随时可点（F6）——提前收尾当前 run，控制器正常退出、已跑轨迹保留，之后照常 Reset / 继续 Run
 - **实时勾选框**：勾选=按墙钟实时播放动画（1 仿真秒≈1 墙钟秒，MCP `run` 的 `realtime` 参数）；取消=全速推进瞬间出结果（跑批验证）
 - **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放
 
@@ -299,7 +343,7 @@ GUI 右侧第五个 tab"Agent"：聊天式下达任务给 AI（OpenAI 兼容 cha
 
 配置保存到 `~/.agentsim/agent.json`，`chmod 0600` 保护 api_key。配好后聊天下达任务（Enter 发送，Shift+Enter 换行）：
 
-- Agent 拿到的是 OpenAI function calling 格式工具清单（`bridge.to_openai_tools`）——MCP 的 10 个工具 + 2 个本地文件工具（`write_file`/`read_file`，限定在世界目录内防越界）
+- Agent 拿到的是 OpenAI function calling 格式工具清单（`bridge.to_openai_tools`）——MCP 的 11 个工具（含 `stop` 停止仿真）+ 2 个本地文件工具（`write_file`/`read_file`，限定在世界目录内防越界）
 - 工具循环：Agent 返回文本 → 显示在聊天框；返回 tool_calls → MCP 同步等回复（QEventLoop + 30s QTimer 兜底）→ 显示工具调用与结果 → 继续下一轮直到 Agent 不再调工具
 - 系统提示词包含：身份（机器人仿真助手）、当前世界名、所有工具清单（MCP + 本地）、建议工作流（read_world → load_world → run → get_observation）
 
@@ -321,13 +365,13 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 157 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
-#              MCP（含 screenshot/zoo_create）/传感器（含 bit 级轨迹守护）/
+# 162 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+#              MCP（含 screenshot/zoo_create/stop）/传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI/
 #              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端
 ```
 
-其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。M5 新增 13 项测试覆盖 demo 生成（全覆盖 + go2 600 tick 行走 >1m + panda 关节活动度）、quat 链路（attach + 欧拉↔四元数 roundtrip + 属性面板应用）、PyHighlighter 四类着色 + CodePanel 保存信号、Agent 后端（config 0600 + chat_url 兼容 + MCP↔OpenAI 工具转换 + 本地文件越界防护）。
+其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。M5 新增 13 项测试覆盖 demo 生成（全覆盖 + go2 600 tick 行走 >1m + panda 关节活动度）、quat 链路（attach + 欧拉↔四元数 roundtrip + 属性面板应用）、PyHighlighter 四类着色 + CodePanel 保存信号、Agent 后端（config 0600 + chat_url 兼容 + MCP↔OpenAI 工具转换 + 本地文件越界防护）。停止功能另加 5 项：内核 `stop_check` 三态（带控制器提前收尾不泄漏 / 无控制器空跑可停 / 恒 False 行为不变）、MCP stop 工具（run 中停止 + 无 run 无操作）、GUI 状态机（停止仅 RUNNING 可用）。
 
 ## 项目结构
 
@@ -352,7 +396,7 @@ agentsim/
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
-└── tests/                 # 157 项测试（含 M5 运动演示 / 位姿编辑 / 代码编辑器 / Agent）
+└── tests/                 # 162 项测试（含 M5 运动演示 / 位姿编辑 / 代码编辑器 / Agent / stop 停止）
 ```
 
 ## Roadmap

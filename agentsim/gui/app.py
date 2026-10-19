@@ -2,7 +2,7 @@
 
 布局：
   菜单栏   文件 / 仿真 / 视图 / 帮助
-  工具栏   打开世界、模型库 | Reset、Run、步进 N、步数、实时 |
+  工具栏   打开世界、模型库 | Reset、Run、停止、步进 N、步数、实时 |
            机位、接触点、坐标系、线框 | 导出截图
   中央     3D 视口（HUD：世界名/状态/相机/FPS/操作提示）
   左停靠   场景树（世界/机器人/物体层级，选中联动右侧属性）
@@ -226,6 +226,9 @@ class MainWindow(QMainWindow):
 
         self.act_reset = mk("重置", "F8", "世界回到 YAML 初态（重编译+重启控制器）")
         self.act_run = mk("运行", "F5", "运行到终态（控制器退出/max_ticks）")
+        self.act_stop = mk("停止", "F6", "停止当前 run（提前收尾，控制器正常退出，"
+                                          "已跑轨迹保留；停止后仍可 Reset/继续 Run）")
+        self.act_stop.triggered.connect(self._on_stop)
         self.act_step = mk("步进", "F7", "推进指定步数后暂停（N 取自工具栏）")
         self.act_screenshot = mk("导出截图…", "Ctrl+S", "把当前视口另存为 PNG")
 
@@ -270,6 +273,7 @@ class MainWindow(QMainWindow):
         m_sim = mb.addMenu("仿真(&S)")
         m_sim.addAction(self.act_reset)
         m_sim.addAction(self.act_run)
+        m_sim.addAction(self.act_stop)
         m_sim.addAction(self.act_step)
         m_sim.addSeparator()
         rt = m_sim.addAction("实时播放（按墙钟）")
@@ -308,6 +312,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_reset)
         tb.addAction(self.act_run)
+        tb.addAction(self.act_stop)
         tb.addAction(self.act_step)
         tb.addWidget(QLabel(" 步数 "))
         tb.addWidget(self.spin_n)
@@ -375,6 +380,7 @@ class MainWindow(QMainWindow):
         self.act_zoo.setEnabled(s != UiState.RUNNING)
         self.act_reset.setEnabled(self.state.can("reset"))
         self.act_run.setEnabled(self.state.can("run"))
+        self.act_stop.setEnabled(self.state.can("stop"))
         self.act_step.setEnabled(self.state.can("run"))
         self.spin_n.setEnabled(s != UiState.RUNNING)
         # 状态灯 + 文字
@@ -844,6 +850,27 @@ class MainWindow(QMainWindow):
         self._log(msg)
         self.client.call_tool("run", args, self._on_run_done)
 
+    def _on_stop(self):
+        """停止当前 run：stop 工具立即返回，run 的响应在下个控制 tick 后
+        照常写回（stats 带 stopped=true）-> _on_run_done 走正常 FINISHED 流程。"""
+        if not self.state.can("stop"):
+            return
+        self.act_stop.setEnabled(False)   # 防连点；收尾或失败后 _apply_state 恢复
+        self._log("请求停止 run…")
+        self.client.call_tool("stop", {}, self._on_stop_done)
+
+    def _on_stop_done(self, err, data):
+        if err:
+            self._log(f"停止请求失败: {data}", "error")
+            self._apply_state("停止失败（run 继续中，可重试）")
+            return
+        if data.get("stopped"):
+            self._log("停止请求已发出，等待 run 收尾…")
+            self._apply_state("正在停止（等 run 收尾）…")
+        else:
+            self._log("没有进行中的 run，无需停止")
+            self._apply_state("没有进行中的 run")
+
     def _on_run_done(self, err, stats):
         self.state.to(UiState.FINISHED)
         self.view.set_hud_state("已结束")
@@ -855,11 +882,13 @@ class MainWindow(QMainWindow):
             self.lbl_tick.setText(f"tick {stats.get('ticks')}")
             succ = stats.get("success")
             crashed = stats.get("crashed") or []
+            stopped = bool(stats.get("stopped"))
+            prefix = "已停止：" if stopped else "运行结束："
             self._apply_state(
-                f"运行结束：ticks={stats.get('ticks')} "
+                f"{prefix}ticks={stats.get('ticks')} "
                 f"成功={'是' if succ else '否'}  reward={stats.get('reward')}")
             self._log(
-                f"结束 ticks={stats.get('ticks')} "
+                f"{'已停止' if stopped else '结束'} ticks={stats.get('ticks')} "
                 f"成功={'是' if succ else '否'} reward={stats.get('reward')} "
                 f"墙钟 {stats.get('wall_time')}s",
                 "ok" if succ else "info")

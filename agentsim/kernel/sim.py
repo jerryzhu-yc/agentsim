@@ -279,7 +279,8 @@ class Simulation:
 
     def run(self, max_ticks: int | None = None,
             on_tick: "callable | None" = None,
-            realtime: bool | None = None) -> dict:
+            realtime: bool | None = None,
+            stop_check: "callable | None" = None) -> dict:
         """推进仿真，返回统计。max_ticks 缺省用世界 task.max_ticks（再缺省 10000）。
 
         on_tick(tick)：每个控制 tick 推进后的回调（GUI/MCP 用来抽观测快照）。
@@ -287,6 +288,10 @@ class Simulation:
 
         realtime：True/False 覆盖世界 runtime.realtime；None 用世界设置。
         开启后按墙钟对齐仿真时间（GUI 看动画用；机器跑批应关闭以全速推进）。
+
+        stop_check()：每个控制 tick 检查一次，返回 True 时提前收尾
+        （GUI"停止"按钮 / MCP stop 工具）。收尾语义与跑满完全一致：
+        控制器收 stop 正常退出（exit 0 不算崩溃），已跑轨迹不变。
         """
         if max_ticks is None:
             max_ticks = self.spec.task.max_ticks
@@ -311,6 +316,8 @@ class Simulation:
         # 无控制器的世界：直接空跑（scene_gen 冒烟等用途）
         if not self._procs:
             for _ in range(max_ticks):
+                if stop_check is not None and stop_check():
+                    break
                 for _ in range(self.spec.ctrl_period):
                     mujoco.mj_step(self.model, self.data)
                 self.tick += 1
@@ -329,6 +336,8 @@ class Simulation:
             self._check_crashes()
 
         while self.tick < max_ticks and self._barrier_participants():
+            if stop_check is not None and stop_check():
+                break
             got_msg = self._poll_once(timeout_ms)
             self._check_crashes()
             parts = self._barrier_participants()

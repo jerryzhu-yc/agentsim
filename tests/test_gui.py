@@ -88,6 +88,15 @@ class TestUiState:
         s.to(UiState.FINISHED)
         assert s.can("run") and s.can("reset")   # FINISHED 点 run = reset 再跑
 
+    def test_stop_only_available_while_running(self):
+        """停止按钮：RUNNING 是唯一可用的状态（run 中其它按钮全灰时它亮）"""
+        s = UiState()
+        for st in (UiState.EMPTY, UiState.IDLE, UiState.FINISHED):
+            s.to(st)
+            assert not s.can("stop"), st
+        s.to(UiState.RUNNING)
+        assert s.can("stop") and not s.can("run") and not s.can("reset")
+
 
 class TestRenderModel:
     def test_apply_observation_and_render(self):

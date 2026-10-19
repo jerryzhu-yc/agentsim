@@ -217,6 +217,44 @@ class TestAgentLoop:
                 t.join(timeout=60)
             s.close()
 
+    def test_stop_tool_stops_running_sim(self):
+        """stop 工具：run 进行中调 stop -> 立即返回且 run 提前收尾，
+        stats 带 stopped=true（停止不是崩溃）。"""
+        import threading
+        import time
+        text = WORLD.read_text(encoding="utf-8")
+        text = text.replace("controller: ../controllers/pick_place.py", "controller:")
+        text = text.replace("max_ticks: 5000", "max_ticks: 100000")
+        s = AgentSimSession()
+        t = None
+        try:
+            s.call_tool("load_world", {"yaml_text": text,
+                                       "base_dir": str(ROOT / "worlds")})
+            done = {}
+
+            def runner():
+                done["stats"] = s.call_tool("run", {})
+
+            t = threading.Thread(target=runner)
+            t.start()
+            time.sleep(1.0)                     # run 进行中
+
+            r = s.call_tool("stop", {})          # 立即返回
+            assert r["stopped"] is True, r
+            t.join(timeout=30)
+            stats = done["stats"]
+            assert stats["stopped"] is True     # run 的响应带停止标记
+            assert stats["ticks"] < 100000       # 确实提前收尾
+            assert stats["crashed"] == []        # 停止不是崩溃
+
+            # 无控制器世界没有进程可泄漏；再验证"没有 run 时 stop 无操作"
+            r2 = s.call_tool("stop", {})
+            assert r2["stopped"] is False
+        finally:
+            if t is not None and t.is_alive():
+                t.join(timeout=30)
+            s.close()
+
     def test_stdio_async_run_interleaved_response(self):
         """stdio 层：run 响应推迟到跑完，期间 ping 立即应答且先到
         （GUI 的请求乱序到达必须按 id 匹配）。"""

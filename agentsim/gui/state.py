@@ -3,7 +3,7 @@
 状态与按钮可用性：
   EMPTY    刚启动（仅 Load 可用）
   IDLE     世界已加载、没在跑（全部可用）
-  RUNNING  run 进行中（全禁用，等它结束）
+  RUNNING  run 进行中（仅停止可用——run 提前收尾，控制器正常退出）
   FINISHED 一轮 run 结束，控制器已退出
            （Load/Reset 可用；点 Run 由 app 层自动 reset 再 run）
 """
@@ -21,6 +21,7 @@ class UiState:
         "load": {EMPTY, IDLE, RUNNING, FINISHED},   # run 中换世界由服务器拒绝
         "reset": {IDLE, FINISHED},
         "run": {IDLE, FINISHED},                    # FINISHED 点击=自动 reset 再 run
+        "stop": {RUNNING},                          # 唯一在 RUNNING 可用的动作
         "observe": {IDLE, FINISHED, RUNNING},
     }
 

@@ -23,9 +23,11 @@ import sys
 import threading
 import time
 
-# 离屏渲染后端默认 EGL（无头/远程友好；默认 GLX 需要真窗口系统）。
-# 必须在 import mujoco 之前设置；用户可用环境变量覆盖（与 gui/__init__.py 同款）。
-os.environ.setdefault("MUJOCO_GL", "egl")
+# 离屏渲染后端：Linux 默认 EGL（无头/远程友好），Windows 默认 wgl
+# （桌面 Windows 无 EGL 用户态库，wgl 是官方支持路径）。必须在 import
+# mujoco 之前设置；用户可用环境变量覆盖（与 gui/__init__.py 同款）。
+os.environ.setdefault("MUJOCO_GL",
+                      "wgl" if sys.platform == "win32" else "egl")
 
 import mujoco
 import yaml
@@ -96,6 +98,14 @@ _TOOLS = [
                                             "缺省 false 全速推进"},
             },
         },
+    },
+    {
+        "name": "stop",
+        "description": "请求停止当前进行中的 run（GUI 停止按钮的同一路径）。"
+                       "立即返回；run 线程在下个控制 tick 提前收尾——控制器收 stop"
+                       " 正常退出（不算崩溃），已跑轨迹保持，run 的响应照常"
+                       " 写回且 stats 带 stopped=true。没有 run 在跑时无操作。",
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "get_observation",
@@ -214,6 +224,7 @@ class AgentSimSession:
         self._run_req = None              # (req_id, writer)：run 结束后写延迟响应
         self._run_error: BaseException | None = None
         self._last_stats: dict | None = None
+        self._stop_event = threading.Event()   # stop 工具 -> run 线程提前收尾
 
     # ------------------------------------------------------------ 工具入口
 
@@ -230,8 +241,10 @@ class AgentSimSession:
         return self._run_thread is not None and self._run_thread.is_alive()
 
     def close(self):
-        # run 还在跑（如 realtime 世界）：给它一点时间收尾，等不及就随进程退出
+        # run 还在跑（如 realtime 世界）：先请求停止（下个 tick 收尾），
+        # 给它一点时间等不住就随进程退出
         if self.is_running and threading.current_thread() is not self._run_thread:
+            self._stop_event.set()
             self._run_thread.join(timeout=5)
         if self._renderer is not None:   # Renderer 绑定的 model 随 sim 一起失效
             self._renderer.close()
@@ -278,6 +291,15 @@ class AgentSimSession:
         """
         return self.start_run(args, block=True)
 
+    def _tool_stop(self, args: dict):
+        """请求停止进行中的 run。立即返回，收尾在下个控制 tick 完成。"""
+        if not self.is_running:
+            return {"stopped": False, "note": "没有进行中的 run，无需停止"}
+        self._stop_event.set()
+        return {"stopped": True,
+                "note": "停止请求已发出：run 线程将在下个控制 tick 收尾，"
+                        "其响应照常写回且带 stopped=true"}
+
     def start_run(self, args: dict, req_id=None, writer=None, block: bool = False):
         """启动后台 run。返回 _DEFERRED（异步）或 stats dict（block=True）。
 
@@ -293,6 +315,7 @@ class AgentSimSession:
         self._run_req = (req_id, writer) if req_id is not None else None
         self._snap = None
         self._snap_t = 0.0
+        self._stop_event.clear()          # 新一轮 run：清掉上一轮的停止请求
 
         def job():
             try:
@@ -315,7 +338,10 @@ class AgentSimSession:
     def _run_job(self, max_ticks, realtime=False):
         sim = self.sim               # 线程里重取（load_world 会换实例）
         stats = dict(sim.run(max_ticks=max_ticks, on_tick=self._on_tick,
-                             realtime=realtime))
+                             realtime=realtime,
+                             stop_check=self._stop_event.is_set))
+        if self._stop_event.is_set():
+            stats["stopped"] = True       # 提前收尾（GUI 停止按钮/stop 工具）
         stats["objects"] = self._objects_pos(sim)
         self._last_stats = stats
         return stats

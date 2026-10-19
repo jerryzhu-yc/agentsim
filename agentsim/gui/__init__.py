@@ -8,9 +8,11 @@ from __future__ import annotations
 import os
 import sys
 
-# 离屏渲染后端默认 EGL（无头/远程友好；默认 GLX 需要真窗口系统）。
+# 离屏渲染后端：Linux 默认 EGL（无头/远程友好），Windows 默认 wgl
+# （桌面 Windows 无 EGL 用户态库，wgl 是官方支持路径）。
 # 必须在 import mujoco 之前设置；用户可用环境变量覆盖。
-os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("MUJOCO_GL",
+                      "wgl" if sys.platform == "win32" else "egl")
 
 
 def main(argv=None) -> int:
