@@ -142,6 +142,7 @@ python -m agentsim mcp
 | `save_state` / `load_state` | 内存快照，物理状态逐位恢复 |
 | `reset` | 世界回到 YAML 初态（重编译 + 控制器进程重启） |
 | `read_world` | 回读当前世界的 YAML 原文 |
+| `save_world` | 当前世界（含 GUI/Agent 全部修改）保存为 YAML 文件；跨目录保存时相对资源路径自动改绝对，任何位置重开都有效 |
 | `zoo_create` | 从模型库（MuJoCo Menagerie）生成可编辑项目：世界 YAML + 控制器模板（含执行器清单与 API 注释）；`key='list'` 只列清单 |
 
 Agent 的标准闭环：`read_world` → 修改 YAML → `load_world(yaml_text)` → `run` → `get_observation` → 观察成败 → 调整 → 重试。
@@ -162,11 +163,14 @@ GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世�
 - **模型库**：选 Menagerie 官方模型（首次联网下载一次）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器——点击-打开-编程闭环
 - **装备页**：选中机器人后点选即可装配/移除 OnRobot 2FG7 夹爪（UR5e/UR10e/xArm7/Panda），并按类型表单添加/删除五类传感器——所有改动写回世界 YAML 并自动重载，无需手写
 - **新建场景**（文件 → 新建场景，Ctrl+N）：选参数化模板（含码垛分区 pallet）→ 设参数 → 保存即生成并加载
+- **保存世界**（Ctrl+S）：拖动/位姿/装备/添加机器人等全部修改写回 YAML 文件——改完的世界可以留到下次（内存世界会提示另存位置；跨目录保存时相对资源路径自动改绝对）
+- **最近打开**（文件菜单）：最近 8 个世界一键重开（跨会话持久化）
+- **添加物体 / 删除节点**（场景菜单）：往场景加方块/圆柱/球（类型/尺寸/颜色，放在相机注视点）；场景树右键或 Del 键删除选中的机器人/物体——搭场景不用手写 YAML
 - **Load**：选择世界 YAML（解析在本地，坏文件直接报错）
 - **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
 - **停止**：run 进行中随时可点（F6）——提前收尾当前 run，控制器正常退出、已跑轨迹保留，之后照常 Reset / 继续 Run
 - **实时勾选框**：勾选=按墙钟实时播放动画（1 仿真秒≈1 墙钟秒，MCP `run` 的 `realtime` 参数）；取消=全速推进瞬间出结果（跑批验证）
-- **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放
+- **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放、**F 键聚焦选中对象**
 
 > run 期间 `get_observation` 返回 33ms 节流的运动学快照（含物体位置 + 四元数），不影响物理轨迹。
 
@@ -359,13 +363,20 @@ GUI（`python -m agentsim gui`）从可视化扩展为完整的机器人编程�
 
 > 四足稳定行走的根因：MuJoCo `attach` 时父世界（默认 Euler 积分器）的 option 会覆盖子模型原值——Spot 原生 `solref=0.004 1` 超硬接触用 `implicitfast`，被 Euler 覆盖后"硬接触+显式积分"会数值震荡弹跳。`WorldSpec` 已加 `integrator` 字段，四足 demo 世界统一设 `implicitfast`。详见 `zoo.py` 中各模型的根因注释。
 
-### 2. 机器人位姿编辑（属性面板）
+### 2. 机器人/物体位姿编辑（属性面板 + 3D 拖动）
 
-在场景树选中机器人节点 → 右侧"属性"面板出现位姿组：3 个 xyz 双精度 SpinBox（步进 0.01m，范围 ±20m）+ 3 个 roll/pitch/yaw 角度框（步进 5°，范围 ±360°）→ "应用位姿"按钮：
+在场景树选中机器人**或物体**节点 → 右侧"属性"面板出现位姿组：3 个 xyz 双精度 SpinBox（步进 0.01m，范围 ±20m）+ 3 个 roll/pitch/yaw 角度框（步进 5°，范围 ±360°）→ "应用位姿"按钮：
 
 - 欧拉角与四元数双向转换（`panels.quat_to_euler` / `euler_to_quat`，ZYX 内旋序）
 - 单位朝向（1,0,0,0）时 YAML 里 `quat` 字段省略（不写就是默认）
-- 应用流程：UI → `read_world` MCP 工具拿当前 YAML → 改 `pos`/`quat` 字段 → `load_world` 重载 → 自动重选该机器人节点
+- 应用流程：UI → `read_world` MCP 工具拿当前 YAML → 改 `pos`/`quat` 字段 → `load_world` 重载 → 自动重选该节点
+- **跑完演示（FINISHED）后也能直接编辑**——提交走 `load_world` 全量重载，世界自动回到 YAML 初态；仅运行中（RUNNING）禁止编辑并给出提示
+
+3D 视口内的拖动（编辑态）：
+
+- **左键拖动**：水平面（XY）内移动选中对象
+- **Ctrl+左键拖动**：沿 Z 轴调高度（向上拖=升）
+- 拖动时 HUD 左上实时显示选中对象的**三维世界坐标**，松手写入世界 YAML 并重载
 
 机器人模型自带 root body 的 pos/quat 会被 `build_world._attach_robot` 清零——`spec.pos`/`spec.quat` 就是机器人 root 的**绝对世界位姿**。例如 `demo_arm.xml` 的 base 自带 0.05m 高度，世界 YAML 里要写 `pos: [0, 0, 0.05]`（吸收内部偏移）。
 
@@ -411,11 +422,13 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 202 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
-#              MCP（含 screenshot/zoo_create/stop）/传感器（含 bit 级轨迹守护）/
+# 206 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+#              MCP（含 screenshot/zoo_create/stop/save_world 往返）/
+#              传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
 #              握手鲁棒性（超时终止/握手期停止/stderr 直通）/模型库/场景生成/
-#              GUI（含深色主题守护、浮动基座 root 位姿同步）/ M5 运动演示 /
+#              GUI（含深色主题守护、浮动基座 root 位姿同步、三维拖动/
+#              FINISHED 可编辑/添加物体对话框）/ M5 运动演示 /
 #              位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
 #              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
 #              码垛分区 pallet / ur10e 入库
@@ -449,7 +462,7 @@ agentsim/
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
-└── tests/                 # 202 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
+└── tests/                 # 206 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
 ```
 
 ## Roadmap

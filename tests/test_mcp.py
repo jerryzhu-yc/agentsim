@@ -15,6 +15,7 @@ import sys
 import threading
 
 import pytest
+import yaml
 
 from agentsim.errors import WorldError
 from agentsim.mcp_server import AgentSimSession   # 导入即 setdefault MUJOCO_GL=egl
@@ -82,6 +83,41 @@ class TestAgentLoop:
             stats = s.call_tool("run", {})
             assert stats["ticks"] == 10
             assert stats["success"] is True
+        finally:
+            s.close()
+
+    def test_save_world_roundtrip(self, tmp_path):
+        """save_world：GUI 拖动/位姿修改（yaml_text 链）后落盘，重开文件
+        修改仍在——"改了半天白改"的守护。"""
+        s = AgentSimSession()
+        try:
+            s.call_tool("load_world", {"yaml_path": str(WORLD)})
+            # 模拟 GUI 编辑：改 cube 位置（去 controller——保存到 tmp 后
+            # 相对路径失效，无控制器也能 load/run）
+            d = yaml.safe_load(s.call_tool("read_world", {}))
+            for r in d.get("robots") or []:
+                r["controller"] = None
+            for o in d["scene"]["objects"]:
+                if o["name"] == "cube":
+                    o["pos"] = [0.42, 0.31, 0.12]
+            new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            s.call_tool("load_world", {"yaml_text": new_text,
+                                       "base_dir": str(ROOT / "worlds")})
+            # 保存回原文件路径
+            out = tmp_path / "saved.yaml"
+            r = s.call_tool("save_world", {"path": str(out)})
+            assert r["saved"] == str(out) and out.exists()
+            # 重开保存的文件：修改还在
+            s.call_tool("load_world", {"yaml_path": str(out)})
+            obs = s.call_tool("get_observation", {})
+            assert obs["objects"]["cube"]["pos"][:3] == [0.42, 0.31, 0.12]
+            # world_path 追踪：yaml_text 重载不换来源文件，缺省保存回原文件
+            s.call_tool("load_world", {"yaml_path": str(WORLD)})
+            s.call_tool("load_world", {"yaml_text": new_text,
+                                       "base_dir": str(ROOT / "worlds")})
+            out2 = tmp_path / "origin.yaml"
+            r2 = s.call_tool("save_world", {"path": str(out2)})
+            assert r2["saved"] == str(out2)      # 显式 path 优先
         finally:
             s.close()
 

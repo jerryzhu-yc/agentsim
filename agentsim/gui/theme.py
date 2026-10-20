@@ -270,7 +270,8 @@ QPlainTextEdit, QTextEdit {{
 }}
 /* 控制台：等宽字体（背景/边框等继承上面的通用规则） */
 QPlainTextEdit#console, QTextEdit#console {{
-    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-family: "JetBrains Mono", "Cascadia Mono", "Consolas",
+                 "DejaVu Sans Mono", monospace;
     font-size: 11.5px;
 }}
 """

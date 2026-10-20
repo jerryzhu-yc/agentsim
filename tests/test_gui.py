@@ -146,6 +146,78 @@ class TestRenderModel:
         finally:
             rm.close()
 
+    def test_apply_move_supports_z(self):
+        """三维拖动：apply_move(dx,dy,dz) 的 dz 必须生效——
+
+        旧版只有平面 (dx,dy)，物体/机器人都抬不起来（用户"提高自由度"
+        的诉求）；机器人 root 是固定体（改 body_pos），物体是 freejoint
+        （改 qpos），两条路径都要验证。
+        """
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            # 机器人（固定基座）：root body_pos.z 抬高 0.15
+            roots = rm.robot_roots["arm"]
+            rm.begin_move(roots)
+            z0 = float(rm.model.body_pos[roots[0]][2])
+            rm.apply_move(0.0, 0.0, 0.15)
+            assert float(rm.model.body_pos[roots[0]][2]) == \
+                pytest.approx(z0 + 0.15)
+            # 世界坐标同步跟上去（HUD 三维坐标读的是 xpos）
+            p = rm.node_world_pos("robot", "arm")
+            assert p[2] > z0 + 0.1
+
+            # 物体（freejoint）：qpos.z 抬高 0.2
+            bid = rm.index.objects["cube"]
+            rm.begin_move([bid])
+            qadr = rm.model.jnt_qposadr[rm.model.body_jntadr[bid]]
+            zq0 = float(rm.data.qpos[qadr + 2])
+            rm.apply_move(0.0, 0.0, 0.2)
+            assert float(rm.data.qpos[qadr + 2]) == pytest.approx(zq0 + 0.2)
+            p = rm.node_world_pos("object", "cube")
+            assert p is not None and p[2] > zq0 + 0.1
+        finally:
+            rm.close()
+
+
+class TestUiStateEdit:
+    def test_edit_allowed_in_idle_and_finished(self):
+        """场景编辑（拖动/位姿/装备）：FINISHED 也放行——
+
+        旧版只认 IDLE，模型库"生成演示并运行"跑完后（FINISHED）改坐标
+        被静默吞掉，用户看到"改了坐标界面不动"。
+        """
+        s = UiState()
+        assert not s.can("edit")
+        s.to(UiState.IDLE)
+        assert s.can("edit")
+        s.to(UiState.FINISHED)
+        assert s.can("edit")          # 跑完演示后仍可调整布局
+        s.to(UiState.RUNNING)
+        assert not s.can("edit")     # 运行中不可编辑
+
+
+def test_add_object_dialog_selection(qapp):
+    """添加物体对话框：三种类型的 MJCF 半尺寸语义 + 颜色取值。"""
+    from agentsim.gui.panels import AddObjectDialog
+
+    dlg = AddObjectDialog()
+    try:
+        dlg._size.setValue(0.1)
+        # box
+        assert dlg.selection() == ("box", (0.1, 0.1, 0.1), "#EF4444")
+        # cylinder
+        dlg._type.setCurrentIndex(1)
+        t, size, color = dlg.selection()
+        assert t == "cylinder" and size == (0.1, 0.1)
+        assert color.startswith("#") and len(color) == 7
+        # sphere
+        dlg._type.setCurrentIndex(2)
+        assert dlg.selection()[0] == "sphere"
+        assert dlg.selection()[1] == (0.1,)
+    finally:
+        dlg.deleteLater()
+
 
 def test_gui_modules_importable():
     """无头 import 冒烟（不建 QApplication）。"""
@@ -245,7 +317,8 @@ def test_quat_euler_roundtrip():
 
 
 def test_properties_pose_panel(qapp):
-    """T5：位姿面板离屏——robot 回填 spin、应用信号 pos/quat、None 语义。"""
+    """T5：位姿面板离屏——robot/object 回填 spin、应用信号 kind/pos/quat、
+    None 语义。（物体也有三维坐标编辑——M7 场景自由度）"""
     from agentsim.gui.panels import PropertiesPanel
 
     class _R:                      # RobotSpec 最小替身
@@ -253,10 +326,17 @@ def test_properties_pose_panel(qapp):
         def __init__(self, pos, quat):
             self.pos = pos; self.quat = quat
 
+    class _O:                      # ObjectSpec 最小替身
+        type = "box"; size = (0.05, 0.05, 0.05); static = False
+        mass = None; color = "#888"
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
     p = PropertiesPanel()
     try:
         got = []
-        p.poseApplied.connect(lambda n, pos, q: got.append((n, pos, q)))
+        p.poseApplied.connect(
+            lambda k, n, pos, q: got.append((k, n, pos, q)))
         # robot 选中：回填 pos + quat->欧拉角
         p.show_node("robot", "arm", _R([0.1, 0.2, 0.5], (0.7071068, 0, 0, 0.7071068)))
         assert p._pose_name == "arm"
@@ -267,15 +347,24 @@ def test_properties_pose_panel(qapp):
             s.setValue(v)
         p._pos_spins[2].setValue(0.75)
         p._on_apply_pose()
-        name, pos, quat = got[-1]
-        assert name == "arm" and pos == [0.1, 0.2, 0.75]
+        kind, name, pos, quat = got[-1]
+        assert kind == "robot" and name == "arm" and pos == [0.1, 0.2, 0.75]
         assert abs(quat[0] - 0.7071068) < 1e-3                 # roll90 等价四元数
         assert abs(quat[1] - 0.7071068) < 1e-3
         # 全零欧拉角 -> 单位朝向 -> quat=None（不落盘）
         for s, v in zip(p._rot_spins, (0.0, 0.0, 0.0)):
             s.setValue(v)
         p._on_apply_pose()
-        assert got[-1][2] is None
+        assert got[-1][3] is None
+        # 物体也开放位姿编辑：cube 选中回填 + 应用带 kind="object"
+        p.show_node("object", "cube", _O([0.5, 0.3, 0.1], None))
+        assert p._pose_kind == "object" and p._pose_name == "cube"
+        assert [s.value() for s in p._pos_spins] == [0.5, 0.3, 0.1]
+        p._pos_spins[0].setValue(0.6)
+        p._on_apply_pose()
+        kind, name, pos, quat = got[-1]
+        assert kind == "object" and name == "cube" and pos[0] == 0.6
+        assert quat is None
         # 清空选择 -> 位姿态复位
         p.clear_selection()
         assert p._pose_name is None

@@ -174,6 +174,20 @@ _TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "save_world",
+        "description": "把当前世界（含 GUI 拖动/位姿/装备等全部修改）保存为 YAML "
+                       "文件。缺省保存回最近一次 load_world(yaml_path) 的文件；"
+                       "内存世界无来源文件时必须显式给 path。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "目标 YAML 路径（缺省 = 最近一次"
+                                        "load_world 的 yaml_path）"},
+            },
+        },
+    },
+    {
         "name": "zoo_create",
         "description": "从模型库（MuJoCo Menagerie 官方模型）生成可编辑项目："
                        "世界 YAML + 控制器模板（含执行器清单与 API 注释），"
@@ -213,6 +227,7 @@ class AgentSimSession:
         self.spec = None
         self.sim: Simulation | None = None
         self.yaml_text: str | None = None
+        self.world_path: str | None = None     # 最近一次 load_world 的来源文件
         # screenshot 渲染器按 (w, h) 缓存；Renderer 绑定 model，
         # load_world/reset 经 close() 一并销毁重建
         self._renderer: "mujoco.Renderer | None" = None
@@ -264,6 +279,7 @@ class AgentSimSession:
         if path is not None:
             spec = _load_world_file(path)          # base_dir = 文件所在目录
             yaml_text = pathlib.Path(path).read_text(encoding="utf-8")
+            new_path = str(pathlib.Path(path).resolve())
         else:
             try:
                 d = yaml.safe_load(text)
@@ -273,9 +289,14 @@ class AgentSimSession:
             base = args.get("base_dir") or "."
             spec.base_dir = pathlib.Path(base).resolve()
             yaml_text = text
+            new_path = None                      # 内存世界（无来源文件）
 
         self.close()
         self.spec, self.yaml_text = spec, yaml_text
+        # 来源文件跟踪：yaml_text 重载（GUI 拖动/位姿提交）不动它——
+        # 那些修改的目标仍是原文件；只有换世界才更新
+        if new_path is not None:
+            self.world_path = new_path
         self.sim = Simulation(spec)
         return {
             "world": spec.name,
@@ -510,6 +531,53 @@ class AgentSimSession:
         if self.yaml_text is None:
             raise WorldError("还没有加载世界（先 load_world）")
         return self.yaml_text
+
+    def _tool_save_world(self, args: dict):
+        """当前世界 YAML 落盘（GUI"保存世界"与 Agent 复用世界都靠它）。
+
+        保存到与来源不同的目录时，robots[].model/controller 的相对路径
+        会跟着新 base_dir 走而失效——统一改写为绝对路径，任何目录重开都行。
+        """
+        if self.yaml_text is None:
+            raise WorldError("还没有加载世界（先 load_world）")
+        path = args.get("path") or self.world_path
+        if not path:
+            raise WorldError("当前世界来自 yaml_text（无来源文件），"
+                              "请显式传 path")
+        p = pathlib.Path(path)
+        if p.suffix.lower() not in (".yaml", ".yml"):
+            p = p.with_suffix(".yaml")
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        text = self.yaml_text
+        base = self.spec.base_dir if self.spec else None
+        try:
+            d = yaml.safe_load(text)
+        except yaml.YAMLError:
+            d = None
+        if base and d:
+            # 相对资源改绝对（model/controller）
+            def abs_of(v):
+                if not v:
+                    return v
+                q = pathlib.Path(str(v))
+                return str(q) if q.is_absolute() else str((base / q).resolve())
+            changed = False
+            for r in d.get("robots") or []:
+                if r.get("model") and not pathlib.Path(str(r["model"])) \
+                        .is_absolute():
+                    r["model"] = abs_of(r["model"])
+                    changed = True
+                if r.get("controller") and not pathlib.Path(str(r["controller"])) \
+                        .is_absolute():
+                    r["controller"] = abs_of(r["controller"])
+                    changed = True
+            if changed:
+                text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+
+        p.write_text(text, encoding="utf-8")
+        return {"saved": str(p), "bytes": len(text.encode("utf-8")),
+                "note": f"世界 '{self.spec.name}' 已保存"}
 
     def _tool_zoo_create(self, args: dict):
         """模型库生成：key='list' 列清单；ensure_only 只取模型路径；否则生成项目。"""

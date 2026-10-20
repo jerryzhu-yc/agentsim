@@ -14,13 +14,15 @@ import math
 import pathlib
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import (QColor, QFont, QKeySequence, QShortcut,
-                           QSyntaxHighlighter, QTextCharFormat, QTextCursor)
-from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox,
-                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QPlainTextEdit,
-                               QPushButton, QStackedWidget, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPixmap,
+                           QShortcut, QSyntaxHighlighter, QTextCharFormat,
+                           QTextCursor)
+from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QMenu, QPlainTextEdit, QPushButton,
+                               QStackedWidget, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from agentsim.gui import theme
 
@@ -61,9 +63,11 @@ class SceneTreePanel(QWidget):
     """左侧场景树：加载世界后展示 世界/机器人(关节)/物体 层级。
 
     nodeSelected(kind:str, name:str, payload)：选中节点时发出，供属性面板显示。
+    nodeDeleteRequested(kind, name)：右键"删除"时发出（app 侧提交 YAML）。
     """
 
     nodeSelected = Signal(str, str, object)
+    nodeDeleteRequested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,6 +91,8 @@ class SceneTreePanel(QWidget):
             1, self._tree.header().ResizeMode.ResizeToContents)
         lay.addWidget(self._tree, stretch=1)
         self._tree.itemSelectionChanged.connect(self._on_select)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
 
         self._spec = None
         self.set_world(None)
@@ -155,13 +161,27 @@ class SceneTreePanel(QWidget):
         kind, name, payload = data
         self.nodeSelected.emit(kind, name, payload)
 
+    def _on_context_menu(self, pos) -> None:
+        """右键菜单：机器人/物体节点 -> 删除（发 nodeDeleteRequested）。"""
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(0, _NODE_KIND)
+        if data is None or data[0] not in ("robot", "object"):
+            return
+        kind, name = data[0], data[1]
+        menu = QMenu(self)
+        act = menu.addAction(f"删除 {name}（从世界移除）")
+        if menu.exec(self._tree.viewport().mapToGlobal(pos)) is act:
+            self.nodeDeleteRequested.emit(kind, name)
+
 
 # ================================================================ 属性面板
 
 class PropertiesPanel(QWidget):
     """右侧属性：上半部分显示选中节点属性，下半部分常驻任务统计。"""
 
-    poseApplied = Signal(str, list, object)   # robot 名, pos, quat(wxyz|None)
+    poseApplied = Signal(str, str, list, object)   # kind, 名字, pos, quat
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -177,7 +197,7 @@ class PropertiesPanel(QWidget):
         self._sel_rows: list[tuple[QLabel, QLabel]] = []
         outer.addWidget(sel_box, stretch=1)
 
-        # 位姿编辑（机器人节点专用）：xyz + 欧拉角（度）-> 应用写回世界 YAML。
+        # 位姿编辑（机器人/物体节点）：xyz + 欧拉角（度）-> 应用写回世界 YAML。
         # quat 单位朝向时不写（保持 YAML 干净，None 语义）
         self._pose_box = QGroupBox("位姿")
         pf = QFormLayout(self._pose_box)
@@ -207,6 +227,7 @@ class PropertiesPanel(QWidget):
         btn.clicked.connect(self._on_apply_pose)
         pf.addRow("", btn)
         self._pose_box.setVisible(False)
+        self._pose_kind: str | None = None
         self._pose_name: str | None = None
         outer.addWidget(self._pose_box)
 
@@ -246,7 +267,8 @@ class PropertiesPanel(QWidget):
         self._clear_rows()
         self._sel_name.setText(name)
         is_robot = kind == "robot"
-        self._pose_box.setVisible(is_robot)
+        has_pose = kind in ("robot", "object")   # 机器人与物体都可编辑位姿
+        self._pose_box.setVisible(has_pose)
         if kind == "world":
             self._add_row("timestep", f"{payload.timestep:g} s")
             self._add_row("ctrl_period", f"{payload.ctrl_period} 步")
@@ -258,7 +280,7 @@ class PropertiesPanel(QWidget):
                           payload.task.max_ticks if payload.task.max_ticks
                           else "不限")
         elif is_robot:
-            self._pose_name = name
+            self._pose_kind, self._pose_name = "robot", name
             self._add_row("模型", payload.model)
             self._add_row("初始位置", _fmt_vec(payload.pos))
             self._add_row("控制器", payload.controller or "（无）")
@@ -267,18 +289,16 @@ class PropertiesPanel(QWidget):
                 self._add_row("args", ", ".join(f"{k}={v}"
                                                 for k, v in payload.args.items()))
             # 选中即回填当前值（拖动后 _on_loaded 重选也会走到这里同步）
-            for s, v in zip(self._pos_spins, payload.pos):
-                s.setValue(float(v))
-            eul = quat_to_euler(payload.quat or (1.0, 0.0, 0.0, 0.0))
-            for s, v in zip(self._rot_spins, eul):
-                s.setValue(v)
+            self._fill_pose(payload.pos, payload.quat)
         elif kind == "object":
+            self._pose_kind, self._pose_name = "object", name
             self._add_row("类型", payload.type)
             self._add_row("尺寸(半)", _fmt_vec(payload.size))
             self._add_row("位置", _fmt_vec(payload.pos))
             self._add_row("固定", "是" if payload.static else "否")
             self._add_row("质量", payload.mass if payload.mass is not None else "自动")
             self._add_row("颜色", payload.color)
+            self._fill_pose(payload.pos, payload.quat)
         elif kind == "sensor":
             self._add_row("类型", payload.type)
             if payload.joint:
@@ -292,7 +312,16 @@ class PropertiesPanel(QWidget):
         self._clear_rows()
         self._sel_name.setText("—")
         self._pose_box.setVisible(False)
+        self._pose_kind = None
         self._pose_name = None
+
+    def _fill_pose(self, pos, quat) -> None:
+        """位姿 spin 回填（机器人/物体共用）。"""
+        for s, v in zip(self._pos_spins, pos):
+            s.setValue(float(v))
+        eul = quat_to_euler(quat or (1.0, 0.0, 0.0, 0.0))
+        for s, v in zip(self._rot_spins, eul):
+            s.setValue(v)
 
     def _on_apply_pose(self) -> None:
         """收集 spin 值 -> poseApplied 信号（app 侧 read_world 写 YAML 重载）。"""
@@ -304,7 +333,7 @@ class PropertiesPanel(QWidget):
         ident = (1.0, 0.0, 0.0, 0.0)
         quat = None if all(abs(v - e) < 1e-6
                            for v, e in zip(quat, ident)) else quat
-        self.poseApplied.emit(self._pose_name, pos, quat)
+        self.poseApplied.emit(self._pose_kind, self._pose_name, pos, quat)
 
     # ------------------------------------------------------------ 任务数据
 
@@ -597,7 +626,12 @@ class CodePanel(QWidget):
         bar.addWidget(btn_save)
         v.addLayout(bar)
         self.edit = QPlainTextEdit()
-        self.edit.setFont(QFont("DejaVu Sans Mono", 10))
+        mono = QFont()
+        mono.setFamilies(["JetBrains Mono", "Cascadia Mono", "Consolas",
+                          "DejaVu Sans Mono"])
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(10)
+        self.edit.setFont(mono)
         self.edit.setPlaceholderText("加载世界后自动载入控制器代码…")
         self._hl = PyHighlighter(self.edit.document())
         # 编辑框聚焦时 Ctrl+S = 保存并运行（优先于全局截图快捷键）
@@ -684,7 +718,12 @@ class AgentPanel(QWidget):
 
         self.chat = QPlainTextEdit()
         self.chat.setReadOnly(True)
-        self.chat.setFont(QFont("DejaVu Sans Mono", 10))
+        chat_mono = QFont()
+        chat_mono.setFamilies(["JetBrains Mono", "Cascadia Mono", "Consolas",
+                               "DejaVu Sans Mono"])
+        chat_mono.setStyleHint(QFont.StyleHint.Monospace)
+        chat_mono.setPointSize(10)
+        self.chat.setFont(chat_mono)
         self.chat.setPlaceholderText("配置好 API 后在此向 AI 下达任务…")
         v.addWidget(self.chat, stretch=1)
 
@@ -1056,3 +1095,60 @@ class GearPanel(QWidget):
             txt = item.text()
             name = txt.split()[0]
             self.remove_sensor.emit(r["name"], name)
+
+
+# ================================================================ 添加物体
+
+_OBJECT_COLORS = [
+    ("红", "#EF4444"), ("橙", "#F97316"), ("黄", "#FACC15"),
+    ("绿", "#22C55E"), ("蓝", "#3B82F6"), ("紫", "#A855F7"),
+]
+
+
+class AddObjectDialog(QDialog):
+    """往场景添加一个物体（类型/尺寸/颜色），放在相机注视点。
+
+    selection() -> (type, size, color)：size 按 MJCF 半尺寸语义——
+    box=(x,y,z 半边)，cylinder=(半径,半高)，sphere=(半径,)。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加物体")
+        form = QFormLayout(self)
+
+        self._type = QComboBox()
+        self._type.addItems(["box（方块）", "cylinder（圆柱）",
+                             "sphere（球）"])
+        form.addRow("类型", self._type)
+
+        self._size = QDoubleSpinBox()
+        self._size.setRange(0.01, 5.0)
+        self._size.setSingleStep(0.05)
+        self._size.setValue(0.08)
+        self._size.setSuffix(" m")
+        self._size.setToolTip("box: 半边长（正方体）；cylinder: 半径；sphere: 半径")
+        form.addRow("尺寸", self._size)
+
+        self._color = QComboBox()
+        for name, hexv in _OBJECT_COLORS:
+            px = QPixmap(14, 14)
+            px.fill(QColor(hexv))
+            self._color.addItem(QIcon(px), name)
+        form.addRow("颜色", self._color)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                 QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def selection(self):
+        idx = self._type.currentIndex()
+        s = round(float(self._size.value()), 4)
+        color = _OBJECT_COLORS[self._color.currentIndex()][1]
+        if idx == 1:
+            return "cylinder", (s, s), color
+        if idx == 2:
+            return "sphere", (s,), color
+        return "box", (s, s, s), color

@@ -19,9 +19,11 @@
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import yaml
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QDialog, QDockWidget, QFileDialog, QFormLayout,
@@ -186,8 +188,11 @@ class MainWindow(QMainWindow):
         # ---- 编辑态数据：当前世界 spec / YAML 基准目录 / 模型库对话框
         self._spec = None
         self._base_dir = None
+        self._world_path = None          # 当前世界来源文件（保存/最近打开用；
+                                         # 拖动/位姿提交的 yaml_text 重载不换它）
         self._zoo_dlg: ZooDialog | None = None
         self._busy = False              # load_world 在途（防重入提交）
+        self._sel_node = None           # 当前选中 (kind, name)（删除按钮用）
 
         # ---- 后端 MCP 客户端
         self.client = McpClient(self)
@@ -206,6 +211,8 @@ class MainWindow(QMainWindow):
         # ---- 面板
         self.scene_tree = SceneTreePanel()
         self.scene_tree.nodeSelected.connect(self._on_node_selected)
+        self.scene_tree.nodeDeleteRequested.connect(
+            lambda k, n: self._on_tree_delete(k, n))
         self.props = PropertiesPanel()
         self.props.poseApplied.connect(self._on_pose_applied)
         self.obs = ObsPanel()
@@ -294,6 +301,10 @@ class MainWindow(QMainWindow):
         self.act_new_scene = mk("新建场景…", "Ctrl+N", "从参数化模板生成场景"
                                 "（含码垛分区 pallet）")
         self.act_zoo = mk("机器人模型库…", "Ctrl+M", "从官方模型库生成项目")
+        self.act_save = mk("保存世界", "Ctrl+S",
+                           "把当前世界（含拖动/位姿/装备等全部修改）"
+                           "写回 YAML 文件")
+        self.act_save.triggered.connect(self._on_save_world)
         self.act_quit = mk("退出", "Ctrl+Q")
         self.act_quit.triggered.connect(self.close)
 
@@ -303,7 +314,13 @@ class MainWindow(QMainWindow):
                                           "已跑轨迹保留；停止后仍可 Reset/继续 Run）")
         self.act_stop.triggered.connect(self._on_stop)
         self.act_step = mk("步进", "F7", "推进指定步数后暂停（N 取自工具栏）")
-        self.act_screenshot = mk("导出截图…", "Ctrl+S", "把当前视口另存为 PNG")
+        self.act_screenshot = mk("导出截图…", "Ctrl+P", "把当前视口另存为 PNG")
+
+        self.act_add_object = mk("添加物体…", "",
+                                 "往场景添加一个物体（放在相机注视点）")
+        self.act_add_object.triggered.connect(self._on_add_object)
+        self.act_delete = mk("删除选中", "Del", "从世界移除选中的机器人/物体")
+        self.act_delete.triggered.connect(self._on_node_delete)
 
         self.act_vis_contacts = mk("接触点", checkable=True)
         self.act_vis_contacts.setToolTip("显示接触点")
@@ -337,12 +354,20 @@ class MainWindow(QMainWindow):
 
         m_file = mb.addMenu("文件(&F)")
         m_file.addAction(self.act_open)
+        self._recent_menu = m_file.addMenu("最近打开")
         m_file.addAction(self.act_new_scene)
         m_file.addAction(self.act_zoo)
+        m_file.addSeparator()
+        m_file.addAction(self.act_save)
         m_file.addSeparator()
         m_file.addAction(self.act_screenshot)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
+        self._rebuild_recent_menu()
+
+        m_edit = mb.addMenu("场景(&C)")
+        m_edit.addAction(self.act_add_object)
+        m_edit.addAction(self.act_delete)
 
         m_sim = mb.addMenu("仿真(&S)")
         m_sim.addAction(self.act_reset)
@@ -447,12 +472,32 @@ class MainWindow(QMainWindow):
     def _log(self, msg: str, level: str = "info") -> None:
         getattr(self.console, level, self.console.info)(msg)
 
+    def _edit_blocked(self, what: str) -> bool:
+        """场景编辑类操作的统一门槛：只拦 RUNNING（并给出明确提示）。
+
+        旧版只在 IDLE 放行，FINISHED（如模型库演示跑完）静默吞掉
+        "应用位姿/拖动/装备"——用户改坐标界面却纹丝不动，无任何反馈。
+        """
+        if self._busy:
+            return True
+        if self.state.value == UiState.RUNNING:
+            self._log(f"运行中不能{what}（先停止或等 run 结束）", "warn")
+            self._apply_state(f"运行中不能{what}——先停止或等 run 结束")
+            return True
+        return False
+
     def _apply_state(self, msg: str = "") -> None:
         s = self.state.value
-        # 编辑模式：仅 IDLE（世界已加载且未被 run 改动）允许拖动改位
-        self.view.edit_allowed = (s == UiState.IDLE)
+        # 编辑模式：IDLE 与 FINISHED 都允许（跑完演示调整布局再跑是高频
+        # 路径）；提交走 load_world 全量重载，天然回到 YAML 初态
+        self.view.edit_allowed = self.state.can("edit")
         self.act_open.setEnabled(s != UiState.RUNNING)
         self.act_zoo.setEnabled(s != UiState.RUNNING)
+        # 场景编辑与保存：IDLE/FINISHED 都可用（拖动/位姿同门槛）
+        can_edit = self.state.can("edit") and self._spec is not None
+        self.act_save.setEnabled(can_edit)
+        self.act_add_object.setEnabled(can_edit)
+        self.act_delete.setEnabled(can_edit and self._sel_node is not None)
         self.act_reset.setEnabled(self.state.can("reset"))
         self.act_run.setEnabled(self.state.can("run"))
         self.act_stop.setEnabled(self.state.can("stop"))
@@ -472,6 +517,10 @@ class MainWindow(QMainWindow):
             self, "选择世界文件", "worlds", "World YAML (*.yaml *.yml)")
         if not path:
             return
+        self._load_world_path(path)
+
+    def _load_world_path(self, path: str):
+        """按路径加载世界（"最近打开"与打开对话框共用）。"""
         try:
             spec = parse_world_file(path)          # 本地解析（渲染模型用）
         except Exception as e:
@@ -481,7 +530,75 @@ class MainWindow(QMainWindow):
         self._log(f"加载世界：{path}")
         self.client.call_tool(
             "load_world", {"yaml_path": path},
-            lambda e, d: self._on_loaded(e, d, spec))
+            lambda e, d: self._on_loaded(e, d, spec, path))
+
+    # ------------------------------------------------------------ 最近打开
+
+    def _recent_list(self) -> list:
+        st = QSettings()
+        try:
+            return json.loads(st.value("recent_worlds", "[]"))
+        except (TypeError, ValueError):
+            return []
+
+    def _push_recent(self, path: str | None) -> None:
+        if not path:
+            return
+        lst = [p for p in self._recent_list() if p != path]
+        lst.insert(0, path)
+        QSettings().setValue("recent_worlds",
+                             json.dumps(lst[:8], ensure_ascii=False))
+
+    def _rebuild_recent_menu(self) -> None:
+        m = getattr(self, "_recent_menu", None)
+        if m is None:
+            return
+        m.clear()
+        lst = self._recent_list()
+        if not lst:
+            a = m.addAction("（暂无）")
+            a.setEnabled(False)
+            return
+        import pathlib
+        for p in lst:
+            def open_it(checked=False, _p=p):
+                import os
+                if os.path.exists(_p):
+                    self._load_world_path(_p)
+                else:
+                    self._log(f"文件不存在：{_p}", "warn")
+                    QMessageBox.information(self, "最近打开", f"文件不存在：\n{_p}")
+            m.addAction(str(pathlib.Path(p).name), open_it)
+
+    def _on_save_world(self):
+        """保存世界：当前内存 YAML（含全部 GUI 修改）写回来源文件。
+
+        无来源文件（内存世界）时让用户选另存位置。
+        """
+        if self._spec is None:
+            QMessageBox.information(self, "保存世界", "还没有加载世界。")
+            return
+        path = self._world_path
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "世界另存为", f"worlds/{self._spec.name}.yaml",
+                "World YAML (*.yaml *.yml)")
+            if not path:
+                return
+            self._world_path = path          # 记住：下次直接保存到这里
+
+        def saved(err, d):
+            if err:
+                self._apply_state(f"保存失败: {d}")
+                self._log(f"保存失败: {d}", "error")
+                QMessageBox.critical(self, "保存世界", f"保存失败：{d}")
+                return
+            self._log(f"世界已保存：{d['saved']}（{d['bytes']} 字节）", "ok")
+            self.statusBar().showMessage(f"世界已保存：{d['saved']}")
+            self._push_recent(self._world_path)
+            self._rebuild_recent_menu()
+
+        self.client.call_tool("save_world", {"path": self._world_path}, saved)
 
     def _on_new_scene(self):
         dlg = NewSceneDialog(self)
@@ -519,7 +636,7 @@ class MainWindow(QMainWindow):
         self._log(f"已生成场景 {name}（模板 {key}）：{out}", "ok")
         self.client.call_tool(
             "load_world", {"yaml_path": str(out)},
-            lambda e, d: self._on_loaded(e, d, spec))
+            lambda e, d: self._on_loaded(e, d, spec, str(out)))
 
     def _on_screenshot(self):
         if self.view._frame is None:
@@ -540,7 +657,10 @@ class MainWindow(QMainWindow):
             self, "关于 AgentSim",
             "<h3>AgentSim</h3>"
             "<p>轻量多机器人仿真平台（MuJoCo + 多进程控制器）。</p>"
-            "<p>快捷键：F5 运行 · F7 步进 · F8 重置 · Ctrl+O 打开世界</p>")
+            "<p>快捷键：F5 运行 · F7 步进 · F8 重置 · Del 删除选中 · "
+            "F 聚焦选中对象<br>"
+            "Ctrl+O 打开 · Ctrl+S 保存世界 · Ctrl+P 截图 · "
+            "Ctrl+左键拖动 调高度</p>")
 
     # ============================================================ 模型库
 
@@ -583,8 +703,7 @@ class MainWindow(QMainWindow):
         self._add_robot_at(key, screen=(relx, rely), note="拖放落点")
 
     def _add_robot_at(self, key: str, screen=None, note: str = ""):
-        if self.state.value == UiState.RUNNING or self._busy:
-            self._log("运行中不能添加机器人（先等 run 结束或 reset）", "warn")
+        if self._edit_blocked("添加机器人"):
             return
         if self._spec is None:
             self._log("先加载一个世界，再把机器人加进场景", "warn")
@@ -652,19 +771,111 @@ class MainWindow(QMainWindow):
 
     # ============================================================ 编辑提交
 
+    def _on_node_delete(self):
+        """删除选中的机器人/物体：read_world -> 移除 -> load_world。"""
+        if self._spec is None or self._edit_blocked("删除节点"):
+            return
+        if not self._sel_node:
+            QMessageBox.information(
+                self, "删除选中", "先在场景树或 3D 视口里选中一个机器人/物体。")
+            return
+        self._delete_node(*self._sel_node)
+
+    def _on_tree_delete(self, kind: str, name: str):
+        """场景树右键删除（目标来自点中的节点而非当前选中）。"""
+        if self._spec is None or self._edit_blocked("删除节点"):
+            return
+        self._delete_node(kind, name)
+
+    def _delete_node(self, kind: str, name: str):
+        """read_world -> 从 robots/objects 移除 -> load_world 提交。"""
+
+        def got_yaml(err, text):
+            if err:
+                self._apply_state(f"read_world 失败: {text}")
+                self._log(f"read_world 失败: {text}", "error")
+                return
+            try:
+                d = yaml.safe_load(text)
+                if kind == "robot":
+                    lst = d.get("robots") or []
+                    d["robots"] = [r for r in lst if r.get("name") != name]
+                else:
+                    sc = d.setdefault("scene", {})
+                    lst = sc.get("objects") or []
+                    sc["objects"] = [o for o in lst if o.get("name") != name]
+                new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            except Exception as e:
+                self._apply_state(f"YAML 修改失败: {e}")
+                self._log(f"YAML 修改失败: {e}", "error")
+                return
+            self._sel_node = None
+            self.view.set_selection("", "")
+            self._reload_yaml(new_text, ok_msg=f"已删除 {kind} '{name}'")
+            self._log(f"已从世界删除 {kind} '{name}'", "ok")
+
+        self.client.call_tool("read_world", {}, got_yaml)
+
+    def _on_add_object(self):
+        """添加物体（类型/尺寸/颜色）到相机注视点。"""
+        if self._spec is None or self._edit_blocked("添加物体"):
+            return
+        from agentsim.gui.panels import AddObjectDialog
+        dlg = AddObjectDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        otype, size, color = dlg.selection()
+        # 放置：相机注视点（x,y），z = 半高/半径（落地）
+        lookat = (self.view.rm.cam.lookat if self.view.rm is not None
+                  else (0.0, 0.0, 0.0))
+        z = {"box": size[2], "sphere": size[0],
+             "cylinder": size[1]}[otype]
+
+        def got_yaml(err, text):
+            if err:
+                self._apply_state(f"read_world 失败: {text}")
+                self._log(f"read_world 失败: {text}", "error")
+                return
+            try:
+                d = yaml.safe_load(text)
+                objs = (d.setdefault("scene", {})).setdefault("objects", [])
+                od = {"name": self._unique_name(otype),
+                      "type": otype,
+                      "size": [round(s, 4) for s in size],
+                      "pos": [round(float(lookat[0]), 4),
+                              round(float(lookat[1]), 4),
+                              round(z, 4)],
+                      "color": color}
+                objs.append(od)
+                new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            except Exception as e:
+                self._apply_state(f"YAML 修改失败: {e}")
+                self._log(f"YAML 修改失败: {e}", "error")
+                return
+            self._pending_select = ("object", od["name"])
+            self._reload_yaml(
+                new_text, ok_msg=f"已添加物体 {od['name']} 于注视点")
+            self._log(f"添加物体 {od['name']}（{otype}），拖动/属性面板"
+                      f"可继续调整位置", "ok")
+
+        self.client.call_tool("read_world", {}, got_yaml)
+
     def _on_view_node_clicked(self, kind: str, name: str):
         """3D 点击 -> 场景树反选（树会再发 nodeSelected 联动属性面板）。"""
         self.scene_tree.select_node(kind, name)
 
-    def _on_body_moved(self, kind: str, name: str, dx: float, dy: float):
+    def _on_body_moved(self, kind: str, name: str,
+                       dx: float, dy: float, dz: float):
         self.statusBar().showMessage(
-            f"移动 {name}: dx={dx:+.2f}  dy={dy:+.2f}（松手提交到世界 YAML）")
+            f"移动 {name}: dx={dx:+.2f}  dy={dy:+.2f}  dz={dz:+.2f}"
+            f"（松手提交到世界 YAML）")
 
-    def _on_body_dropped(self, kind: str, name: str, dx: float, dy: float):
+    def _on_body_dropped(self, kind: str, name: str,
+                         dx: float, dy: float, dz: float):
         """拖动松手：read_world -> 改 pos -> load_world(yaml_text) 提交。"""
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+        if self._spec is None or self._edit_blocked("拖动移位"):
             return
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6 and abs(dz) < 1e-6:
             return
 
         def got_yaml(err, text):
@@ -679,7 +890,7 @@ class MainWindow(QMainWindow):
                     for r in d.get("robots") or []:
                         if r.get("name") == name:
                             p = list(r.get("pos") or [0, 0, 0])
-                            p = [p[0] + dx, p[1] + dy, p[2]]
+                            p = [p[0] + dx, p[1] + dy, p[2] + dz]
                             r["pos"] = [round(v, 4) for v in p]
                             moved = True
                             break
@@ -687,7 +898,7 @@ class MainWindow(QMainWindow):
                     for o in (d.get("scene") or {}).get("objects") or []:
                         if o.get("name") == name:
                             p = list(o.get("pos") or [0, 0, 0])
-                            p = [p[0] + dx, p[1] + dy, p[2]]
+                            p = [p[0] + dx, p[1] + dy, p[2] + dz]
                             o["pos"] = [round(v, 4) for v in p]
                             moved = True
                             break
@@ -702,13 +913,17 @@ class MainWindow(QMainWindow):
             self._pending_select = (kind, name)   # 重载后重选（属性面板同步）
             self._reload_yaml(
                 new_text,
-                ok_msg=f"{name} 移动 ({dx:+.2f}, {dy:+.2f}) 已写入世界 YAML")
+                ok_msg=f"{name} 移动 ({dx:+.2f}, {dy:+.2f}, {dz:+.2f})"
+                       f" 已写入世界 YAML")
 
         self.client.call_tool("read_world", {}, got_yaml)
 
-    def _on_pose_applied(self, name: str, pos: list, quat):
-        """属性面板"应用位姿"：read_world -> 写 pos/quat -> load_world 提交。"""
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+    def _on_pose_applied(self, kind: str, name: str, pos: list, quat):
+        """属性面板"应用位姿"：read_world -> 写 pos/quat -> load_world 提交。
+
+        机器人与物体都支持（物体也有三维坐标编辑）。
+        """
+        if self._spec is None or self._edit_blocked("应用位姿"):
             return
 
         def got_yaml(err, text):
@@ -718,10 +933,14 @@ class MainWindow(QMainWindow):
                 return
             try:
                 d = yaml.safe_load(text)
-                rd = next((r for r in d.get("robots") or []
-                           if r.get("name") == name), None)
+                if kind == "robot":
+                    rd = next((r for r in d.get("robots") or []
+                               if r.get("name") == name), None)
+                else:
+                    rd = next((o for o in (d.get("scene") or {}).get("objects")
+                               or [] if o.get("name") == name), None)
                 if rd is None:
-                    self._log(f"世界 YAML 里没找到机器人 '{name}'", "warn")
+                    self._log(f"世界 YAML 里没找到{kind} '{name}'", "warn")
                     return
                 rd["pos"] = pos
                 if quat is None:              # 单位朝向不落盘（YAML 干净）
@@ -733,7 +952,7 @@ class MainWindow(QMainWindow):
                 self._apply_state(f"YAML 修改失败: {e}")
                 self._log(f"YAML 修改失败: {e}", "error")
                 return
-            self._pending_select = ("robot", name)
+            self._pending_select = (kind, name)
             msg = (f"{name} 位姿已写入：pos=({pos[0]:+.3f}, {pos[1]:+.3f}, "
                    f"{pos[2]:+.3f})" + ("" if quat is None else
                                        f" quat=({', '.join(f'{v:.4f}' for v in quat)})"))
@@ -786,7 +1005,7 @@ class MainWindow(QMainWindow):
         load_world 会重启控制器进程，新代码即生效（World as Code 同款机制）。
         Ctrl+S 在编辑框聚焦时也走这里（QShortcut 已绑）。
         """
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+        if self._spec is None or self._edit_blocked("保存并运行"):
             return
         rd = next((r for r in self._spec.robots if r.name == robot_name), None)
         if rd is None or not rd.controller:
@@ -854,7 +1073,7 @@ class MainWindow(QMainWindow):
             return
 
         def loaded(e, d):
-            self._on_loaded(e, d, spec)
+            self._on_loaded(e, d, spec, world)
             if is_demo and not e and self.state.can("run"):
                 self._do_run(self._run_args())       # 直接看动画
 
@@ -870,13 +1089,17 @@ class MainWindow(QMainWindow):
 
     # ============================================================ 仿真流程
 
-    def _on_loaded(self, err, data, spec):
+    def _on_loaded(self, err, data, spec, path=None):
         if err:
             self._apply_state(f"load_world 失败: {data}")
             self._log(f"load_world 失败: {data}", "error")
             return
         self._spec = spec                        # 编辑基准（拖动提交 YAML 用）
         self._base_dir = spec.base_dir
+        if path:                                 # 新来源文件：记录 + 最近打开
+            self._world_path = path
+            self._push_recent(path)
+            self._rebuild_recent_menu()
         self.view.set_world(spec)
         self.view.set_hud_state("就绪")
         self.scene_tree.set_world(spec)
@@ -922,7 +1145,7 @@ class MainWindow(QMainWindow):
 
     def _on_gear_gripper(self, robot_name: str, gripper: dict | None):
         """应用/移除夹爪：改 robots[i].gripper 后全文重载。"""
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+        if self._spec is None or self._edit_blocked("装配夹爪"):
             return
 
         def got_yaml(err, text):
@@ -950,7 +1173,7 @@ class MainWindow(QMainWindow):
         self.client.call_tool("read_world", {}, got_yaml)
 
     def _on_gear_add_sensor(self, robot_name: str, sensor: dict):
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+        if self._spec is None or self._edit_blocked("添加传感器"):
             return
 
         def got_yaml(err, text):
@@ -979,7 +1202,7 @@ class MainWindow(QMainWindow):
         self.client.call_tool("read_world", {}, got_yaml)
 
     def _on_gear_remove_sensor(self, robot_name: str, sensor_name: str):
-        if self._spec is None or self.state.value != UiState.IDLE or self._busy:
+        if self._spec is None or self._edit_blocked("删除传感器"):
             return
 
         def got_yaml(err, text):
@@ -1112,6 +1335,7 @@ class MainWindow(QMainWindow):
             self.cam_combo.setCurrentIndex(idx)
 
     def _on_node_selected(self, kind: str, name: str, payload) -> None:
+        self._sel_node = (kind, name)         # 删除按钮的目标
         self.props.show_node(kind, name, payload)
         self.view.set_selection(kind, name)   # 场景树 -> 3D 高亮（单向）
         if self.tabs.currentIndex() != 0:

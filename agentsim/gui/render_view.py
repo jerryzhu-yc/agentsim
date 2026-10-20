@@ -260,18 +260,33 @@ class RenderModel:
                     (int(bid), False, -1,
                      np.array(self.model.body_pos[bid])))
 
-    def apply_move(self, dx: float, dy: float) -> None:
-        """把 begin_move 后的当前拖动量 (dx, dy) 施加到记录的 bodies。"""
+    def apply_move(self, dx: float, dy: float, dz: float = 0.0) -> None:
+        """把 begin_move 后的当前拖动量 (dx, dy, dz) 施加到记录的 bodies。"""
         if not self._move_orig:
             return
         for bid, is_free, adr, orig in self._move_orig:
             if is_free:
                 self.data.qpos[adr] = orig[0] + dx
                 self.data.qpos[adr + 1] = orig[1] + dy
+                self.data.qpos[adr + 2] = orig[2] + dz
             else:
                 self.model.body_pos[bid][0] = orig[0] + dx
                 self.model.body_pos[bid][1] = orig[1] + dy
+                self.model.body_pos[bid][2] = orig[2] + dz
         mujoco.mj_forward(self.model, self.data)
+
+    def node_world_pos(self, kind: str, name: str):
+        """对象/机器人 root body 的当前世界坐标（HUD 三维坐标显示用；
+        拖动预览会实时改 qpos/body_pos -> mj_forward 后这里读到实时值）。"""
+        if kind == "object":
+            bid = self.index.objects.get(name)
+            return (tuple(self.data.xpos[int(bid)])
+                    if bid is not None else None)
+        roots = self.robot_roots.get(name) or []
+        if not roots:
+            return None
+        x = self.data.xpos[roots[0]]
+        return (float(x[0]), float(x[1]), float(x[2]))
 
     # ------------------------------------------------------------ 渲染
 
@@ -324,6 +339,7 @@ class RenderView(QWidget):
 
     鼠标（Webots 惯例）：
       左键点中对象   选中并拖动移动（编辑态才可拖；发送 nodeClicked）
+      Ctrl+左键点中  选中并沿 Z 轴拖动（调高度）
       左键点空白     旋转视角
       中键拖动        俯仰（z 向视角）
       右键/Shift+左键 平移
@@ -331,15 +347,15 @@ class RenderView(QWidget):
     拖放：模型库 QListWidget 的条目可拖入视口 -> dropModelRequested
 
     信号：
-      nodeClicked(kind, name)        3D 点击选中（场景树联动）
-      bodyMoved(kind, name, dx, dy)  拖动过程（状态栏提示用）
-      bodyDropped(kind, name, dx, dy)拖动松手（app 提交 YAML）
-      dropModelRequested(key, relx, rely)  模型库拖放添加机器人
+      nodeClicked(kind, name)            3D 点击选中（场景树联动）
+      bodyMoved(kind, name, dx, dy, dz)  拖动过程（状态栏提示用）
+      bodyDropped(kind, name, dx, dy, dz)拖动松手（app 提交 YAML）
+      dropModelRequested(key, relx, rely)      模型库拖放添加机器人
     """
 
     nodeClicked = Signal(str, str)
-    bodyMoved = Signal(str, str, float, float)
-    bodyDropped = Signal(str, str, float, float)
+    bodyMoved = Signal(str, str, float, float, float)
+    bodyDropped = Signal(str, str, float, float, float)
     dropModelRequested = Signal(str, float, float)
 
     def __init__(self, parent=None):
@@ -453,7 +469,10 @@ class RenderView(QWidget):
 
     def _draw_hud(self, p: QPainter) -> None:
         """专业仿真器风格的半透明信息叠加。"""
-        font = QFont("Noto Sans Mono, DejaVu Sans Mono", 9)
+        font = QFont()
+        font.setFamilies(["Cascadia Mono", "Consolas", "Noto Sans Mono",
+                         "DejaVu Sans Mono"])
+        font.setPointSize(9)
         p.setFont(font)
         fm = p.fontMetrics()
 
@@ -475,10 +494,18 @@ class RenderView(QWidget):
         state_line = f"状态: {self._hud_state}"
         if self.edit_allowed:
             state_line += "  [编辑模式]"
-        chip(10, 10,
-             [f"世界: {self._hud_world}", state_line],
-             accent=theme.C_RUNNING if self._hud_state == "运行中"
-             else theme.C_ACCENT)
+        y = chip(10, 10,
+                 [f"世界: {self._hud_world}", state_line],
+                 accent=theme.C_RUNNING if self._hud_state == "运行中"
+                 else theme.C_ACCENT)
+
+        # 选中对象的三维坐标（拖动中实时变化——用户拖动定位的直接参照）
+        if self.rm is not None and self._selection[0]:
+            p = self.rm.node_world_pos(*self._selection)
+            if p is not None:
+                chip(10, y, [f"选中 {self._selection[1]}  "
+                             f"pos=({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f})"],
+                     accent=theme.C_OK)
 
         # 左下：相机参数 + FPS
         if self.rm is not None:
@@ -489,8 +516,8 @@ class RenderView(QWidget):
                   f"渲染 {self._fps_ema:5.1f} FPS"])
 
         # 右下：鼠标操作提示
-        help_lines = ["左键 选中/拖动   中键 俯仰   右键 平移",
-                      "滚轮 缩放   模型库可拖入机器人"]
+        help_lines = ["左键 选中/拖动   Ctrl+左键 调高度(Z)   F 聚焦选中",
+                      "中键 俯仰   右键 平移   滚轮 缩放   模型库可拖入"]
         w = max(fm.horizontalAdvance(t) for t in help_lines) + 12
         x = self.width() - w - 10
         y = self.height() - 12 - fm.height() * 2 - 8
@@ -538,8 +565,14 @@ class RenderView(QWidget):
                         else self.rm.robot_roots.get(name, []))
                 if bids:
                     self.rm.begin_move(bids)
-                    self._drag = ("body", kind, name, selpnt, 0.0, 0.0,
-                                  False)
+                    if bool(e.modifiers() & Qt.KeyboardModifier.
+                            ControlModifier):
+                        # Ctrl+左键：Z 轴模式（调高度）——向上拖=升
+                        self._drag = ("bodyz", kind, name,
+                                      e.position().y(), 0.0, False)
+                    else:
+                        self._drag = ("body", kind, name, selpnt, 0.0, 0.0,
+                                      False)
             return
         self._drag = ("rotate", e.position().x(), e.position().y(),
                       self.rm.cam.azimuth, self.rm.cam.elevation)
@@ -567,7 +600,15 @@ class RenderView(QWidget):
                 if (ndx, ndy) != (dx, dy):
                     self.rm.apply_move(ndx, ndy)
                     self._drag = ("body", kind, name, selpnt, ndx, ndy, True)
-                    self.bodyMoved.emit(kind, name, ndx, ndy)
+                    self.bodyMoved.emit(kind, name, ndx, ndy, 0.0)
+        elif mode == "bodyz":
+            # Z 轴拖动：屏幕 y 位移 -> 世界 dz（向上拖=升，与缩放距离成比例）
+            _, kind, name, y0, dz, _moved = self._drag
+            ndz = -(e.position().y() - y0) * self.rm.cam.distance * 0.0015
+            if ndz != dz:
+                self.rm.apply_move(0.0, 0.0, ndz)
+                self._drag = ("bodyz", kind, name, y0, ndz, True)
+                self.bodyMoved.emit(kind, name, 0.0, 0.0, ndz)
         else:                                   # pan
             _, x0, y0 = self._drag
             dx = e.position().x() - x0
@@ -583,10 +624,14 @@ class RenderView(QWidget):
         self.refresh()
 
     def mouseReleaseEvent(self, _e) -> None:
-        if (self._drag is not None and self._drag[0] == "body"
-                and self._drag[6]):
+        if self._drag is not None and self._drag[0] == "body" \
+                and self._drag[6]:
             _, kind, name, _selpnt, dx, dy, _moved = self._drag
-            self.bodyDropped.emit(kind, name, dx, dy)
+            self.bodyDropped.emit(kind, name, dx, dy, 0.0)
+        elif self._drag is not None and self._drag[0] == "bodyz" \
+                and self._drag[5]:
+            _, kind, name, _y0, dz, _moved = self._drag
+            self.bodyDropped.emit(kind, name, 0.0, 0.0, dz)
         self._drag = None
 
     def wheelEvent(self, e) -> None:
@@ -595,6 +640,17 @@ class RenderView(QWidget):
         factor = 1.1 if e.angleDelta().y() > 0 else 1 / 1.1
         self.rm.cam.distance = max(0.2, self.rm.cam.distance * factor)
         self.refresh()
+
+    def keyPressEvent(self, e) -> None:
+        """F = 聚焦选中对象（相机注视点移过去；Webots/Blender 惯例）。"""
+        if (e.key() == Qt.Key.Key_F and self.rm is not None
+                and self._selection[0]):
+            p = self.rm.node_world_pos(*self._selection)
+            if p is not None:
+                self.rm.cam.lookat[:3] = [p[0], p[1], p[2]]
+                self.refresh()
+                return
+        super().keyPressEvent(e)
 
     # ------------------------------------------------------------ 拖放（模型库）
 
