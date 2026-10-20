@@ -29,6 +29,12 @@ from agentsim.kernel.task import (robot_obs, sensors_obs, task_reward,
 from agentsim.world.builder import build_world, resolve_task
 from agentsim.world.schema import WorldSpec
 
+# 控制器握手超时（秒）。spawn 后进程活着但迟迟不发 hello——典型如
+# Windows 上控制器 import/模型加载卡死——超过此时长放弃等待并报错，
+# 否则 run() 永久挂起（GUI 表现为"无仿真、无法停止、没有 tick"）。
+# 测试可 monkeypatch 本常量缩短等待。
+_HANDSHAKE_TIMEOUT = 30.0
+
 
 class Simulation:
     """单实例一次仿真。__init__ 起进程，run 驱动，close 收尾。"""
@@ -83,10 +89,14 @@ class Simulation:
                 path = self.spec.base_dir / path
             if not path.exists():
                 raise WorldError(f"机器人 '{rd.name}' 的控制器不存在: {path}")
+            # stdout 必须吞掉：内核若在 MCP 后端里跑，stdout 是 JSON-RPC
+            # 协议通道，控制器 print 会污染协议流。stderr 直通继承——
+            # 控制器起不来（import 报错等）的真相必须可见，否则
+            # Windows 上"无报错但卡死"无从诊断（GUI 控制台/后端日志链路）。
             self._procs[rd.name] = subprocess.Popen(
                 [sys.executable, str(path),
                  "--sock", self._addr, "--robot", rd.name],
-                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                env=env, stdout=subprocess.DEVNULL, stderr=None)
 
     # ---------------------------------------------------------------- 收发
 
@@ -326,12 +336,32 @@ class Simulation:
                 _pace()
             return self._stats(t_start, sim_start)
 
-        # 等所有控制器完成握手（进程死光则放弃等待）
+        # 等所有控制器完成握手（进程死光则放弃等待）。
+        # 必须有 stop 出口和超时：进程活着但握手不完成时（Windows 上
+        # 控制器 import/加载卡死的典型症状），原先这里会永久转圈——
+        # run() 不返回、stop_check 无人查，GUI 就是"卡住且无法停止"。
         self._check_crashes()   # 先扫一遍：spawn 后即死的控制器要在 stats 里可见
+        hs_deadline = time.perf_counter() + _HANDSHAKE_TIMEOUT
         while True:
             parts = self._barrier_participants()
             if not parts or all(self._st[n]["active"] for n in parts):
                 break
+            if stop_check is not None and stop_check():
+                # 停止请求落在握手等待期：此时控制器还没进 step 循环，
+                # 无法用 stop 消息优雅收尾，直接终止进程（标记 done，
+                # 不计 crashed——这是用户主动停止，不是故障）
+                self._abort_controllers()
+                return self._stats(t_start, sim_start)
+            if time.perf_counter() > hs_deadline:
+                diag = "、".join(
+                    n for n in parts if not self._st[n]["active"])
+                self._abort_controllers()
+                raise WorldError(
+                    f"控制器握手超时（{_HANDSHAKE_TIMEOUT:.0f}s）: {diag}。"
+                    "进程存活但迟迟未发 hello，常见原因：控制器脚本 import "
+                    "或模型加载卡死/极慢（Windows 冷启动尤甚）。控制器 "
+                    "stderr 已直通内核错误输出，真实报错请到 GUI 控制台/"
+                    "后端日志查看。")
             self._poll_once(timeout_ms)
             self._check_crashes()
 
@@ -376,6 +406,25 @@ class Simulation:
             self._poll_once(50)
             self._check_crashes()
             self._notify_stop()
+
+    def _abort_controllers(self, grace_ms: int = 500) -> None:
+        """异常中止（握手超时/握手期停止）时的兜底收尾。
+
+        正常收尾靠 stop 消息，但握手等待期的控制器要么还在 Python
+        启动中、要么阻塞在等 hello 回复，没有"正在等 step 回复"的
+        机会，stop 消息对它们无效——不终止就永久泄漏（进程活着但
+        无人应答）。先 drain 一小段给已进 step 循环的控制器一个
+        优雅退出的机会，剩下的直接 terminate。
+        """
+        self._notify_stop()
+        self._drain_controllers(grace_ms)
+        for name, proc in self._procs.items():
+            if proc.poll() is None:
+                # 标 done 防 _check_crashes 误报 crashed（用户主动
+                # 停止/超时中止不属于进程故障）
+                self._st[name]["done"] = True
+                self._st[name]["active"] = False
+                proc.terminate()
 
     def _poll_once(self, timeout_ms: int) -> bool:
         """收一条消息。返回 False 表示 poll 超时（队列空）。

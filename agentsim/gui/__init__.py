@@ -22,7 +22,8 @@ def main(argv=None) -> int:
 
     app = QApplication(argv if argv is not None else sys.argv)
     from agentsim.gui import theme
-    app.setStyleSheet(theme.APP_QSS)
+    theme.apply_dark_palette(app)      # 深色基调打底（占位符/禁用态等 palette 通道）
+    app.setStyleSheet(theme.APP_QSS)   # QSS 覆盖主要控件
     win = MainWindow()
     win.show()
     return app.exec()

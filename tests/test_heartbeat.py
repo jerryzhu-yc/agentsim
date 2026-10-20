@@ -39,6 +39,20 @@ elif mode == "think":
 
 
 def _pid_alive(pid: int) -> bool:
+    # os.kill(pid, 0) 在 Windows 上语义是 CTRL_C_EVENT（发信号），
+    # 不是存活探测——跨平台要用 Win32 API
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259    # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -91,7 +105,7 @@ def test_think_time_no_false_kill(tmp_path):
 
 
 def test_orphan_detection_raises(monkeypatch):
-    """T3：_recv 孤儿分支——父 pid 变化时 RuntimeError 带明确提示。"""
+    """T3：_recv 孤儿分支——父进程死亡检测触发时 RuntimeError 带明确提示。"""
     robot = C.Robot.__new__(C.Robot)     # 绕过 __init__（无需真内核）
     ctx = zmq.Context()
     robot._sock = ctx.socket(zmq.REQ)
@@ -99,8 +113,26 @@ def test_orphan_detection_raises(monkeypatch):
     robot._sock.connect("tcp://127.0.0.1:1")   # 无人监听：永远收不到回复
     robot._parent_pid = os.getppid()
     robot._sock.send(b'{"op": "hello"}')       # REQ 入队不阻塞
-    monkeypatch.setattr(C.os, "getppid", lambda: 999)
+    # 直接模拟死亡判定（真实机制在 _parent_dead：POSIX 看 getppid 变化，
+    # Windows 用 OpenProcess/GetExitCodeProcess，平台差异对 _recv 透明）
+    monkeypatch.setattr(C.Robot, "_parent_dead", lambda self: True)
     with pytest.raises(RuntimeError, match="内核已退出"):
         robot._recv()
     robot._sock.close()
     ctx.term()
+
+
+def test_parent_dead_live_parent():
+    """_parent_dead：父进程（pytest 自身）活着时返回 False。"""
+    robot = C.Robot.__new__(C.Robot)
+    robot._parent_pid = os.getppid()
+    assert robot._parent_dead() is False
+
+
+def test_parent_dead_dead_process():
+    """_parent_dead：目标进程已退出时返回 True（跨平台死亡探测）。"""
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    robot = C.Robot.__new__(C.Robot)
+    robot._parent_pid = p.pid
+    assert robot._parent_dead() is True

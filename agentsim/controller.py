@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import zmq
 
@@ -31,8 +32,8 @@ class Robot:
         ns = self._parse_args()
         self.name = ns.robot
         # 心跳：记录父进程（内核）pid。内核是控制器的直接父进程
-        # （Simulation spawn），内核一死控制器就被 init/subreaper 收养，
-        # getppid 必变——这是崩溃可感知的信号
+        # （Simulation spawn），内核一死即被感知——检测方式见
+        # _parent_dead()（POSIX 与 Windows 机制不同）
         self._parent_pid = os.getppid()
         self._ctx = zmq.Context()
         self._sock = self._ctx.socket(zmq.REQ)
@@ -147,12 +148,37 @@ class Robot:
         self._sock.send(json.dumps(msg).encode())
         return self._recv()
 
+    def _parent_dead(self) -> bool:
+        """内核（父进程）是否已死亡。
+
+        POSIX：父死后子进程被 init/subreaper 收养，getppid 必变。
+        Windows：没有收养机制，父死后 getppid 仍返回原 pid（C 运行时
+        缓存），只能用 Win32 API 探测：OpenProcess 打不开（进程已
+        消失/句柄无效）或 GetExitCodeProcess != STILL_ACTIVE 即死亡。
+        """
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, self._parent_pid)
+            if not handle:
+                return True                   # 进程不存在（或已无权查询）
+            try:
+                code = ctypes.c_ulong()
+                kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return code.value != STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        return os.getppid() != self._parent_pid
+
     def _recv(self) -> dict:
         """等回复：100ms poller 轮询 + 父进程孤儿检测（心跳）。
 
         等待在语义上仍然无限（Webots：等世界，Agent 思考多久都行）——
-        唯一的退出条件是内核进程死亡：父 pid 变化 = 被 init/subreaper
-        收养，此时 RuntimeError 提示用户脚本结束（不捕获则进程非零退出）。
+        唯一的退出条件是内核进程死亡（_parent_dead，跨平台），
+        此时 RuntimeError 提示用户脚本结束（不捕获则进程非零退出）。
         内核正常收尾走 stop/bye_ack 回复路径，不经孤儿检测。
         """
         poller = zmq.Poller()
@@ -161,7 +187,7 @@ class Robot:
             while True:
                 if poller.poll(100):          # 有消息立即返回（微秒级）
                     return json.loads(self._sock.recv())
-                if os.getppid() != self._parent_pid:
+                if self._parent_dead():
                     raise RuntimeError(
                         "内核已退出（心跳检测到父进程变化）——请结束控制器脚本")
         finally:

@@ -256,16 +256,56 @@ QToolTip {{
     border-radius: 3px;
 }}
 
-/* ---------------- 控制台 ---------------- */
-QPlainTextEdit#console, QTextEdit#console {{
+/* ---------------- 文本编辑区 ----------------
+   代码编辑器 / Agent 对话框 / 控制台统一深底：语法高亮用的是深色主题
+   配色，Windows/macOS 浅色系统主题下不强制深底就会白底配浅色高亮，
+   代码看不清。 */
+QPlainTextEdit, QTextEdit {{
     background: #18191c;
     border: 1px solid {C_BORDER};
     border-radius: 4px;
+    color: {C_TEXT};
+    selection-background-color: {C_ACCENT};
+    selection-color: white;
+}}
+/* 控制台：等宽字体（背景/边框等继承上面的通用规则） */
+QPlainTextEdit#console, QTextEdit#console {{
     font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
     font-size: 11.5px;
-    color: {C_TEXT};
 }}
 """
+
+
+def apply_dark_palette(app) -> None:
+    """给 QApplication 打深色调色板（QSS 之外的兜底）。
+
+    QSS 覆盖了主要控件，但占位符文字、禁用态文字、原生部件等仍读
+    palette——Windows 默认浅色调色板会让这些地方白底黑字。
+    在 setStyleSheet 之前调用。
+    """
+    from PySide6.QtGui import QColor, QPalette
+
+    roles = QPalette.ColorRole
+    groups = QPalette.ColorGroup
+    p = QPalette()
+    p.setColor(roles.Window, QColor(C_BG))
+    p.setColor(roles.WindowText, QColor(C_TEXT))
+    p.setColor(roles.Base, QColor("#18191c"))
+    p.setColor(roles.AlternateBase, QColor(C_BG_ALT))
+    p.setColor(roles.Text, QColor(C_TEXT))
+    p.setColor(roles.Button, QColor(C_BG_ALT))
+    p.setColor(roles.ButtonText, QColor(C_TEXT))
+    p.setColor(roles.ToolTipBase, QColor(C_BG_INPUT))
+    p.setColor(roles.ToolTipText, QColor(C_TEXT))
+    p.setColor(roles.BrightText, QColor("#ffffff"))
+    p.setColor(roles.Highlight, QColor(C_ACCENT))
+    p.setColor(roles.HighlightedText, QColor("#ffffff"))
+    p.setColor(roles.PlaceholderText, QColor(C_TEXT_DIM))
+    p.setColor(roles.Link, QColor(C_ACCENT))
+    dim = QColor(C_TEXT_DIM)
+    for role in (roles.WindowText, roles.Text, roles.ButtonText):
+        p.setColor(groups.Disabled, role, dim)
+    app.setPalette(p)
 
 
 def state_color(state: str) -> str:

@@ -162,6 +162,31 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
+def test_dark_theme_covers_all_text_edits():
+    """深色主题回归守护：QSS 必须覆盖所有 QPlainTextEdit/QTextEdit。
+
+    旧版只给 #console 上深底，代码编辑器/Agent 对话框落在系统调色板——
+    Windows 浅色主题下白底配深色语法高亮，代码看不清。
+    """
+    from agentsim.gui import theme
+    assert "QPlainTextEdit, QTextEdit" in theme.APP_QSS
+    assert "selection-background-color" in theme.APP_QSS
+    assert "#console" in theme.APP_QSS      # 控制台等宽字体规则仍在
+
+
+def test_apply_dark_palette(qapp):
+    """apply_dark_palette：调色板 Base/Window 转深、Text 转亮。"""
+    from PySide6.QtGui import QPalette
+
+    from agentsim.gui import theme
+    theme.apply_dark_palette(qapp)
+    pal = qapp.palette()
+    assert pal.color(QPalette.ColorRole.Base).lightness() < 40
+    assert pal.color(QPalette.ColorRole.Window).lightness() < 40
+    assert pal.color(QPalette.ColorRole.Text).lightness() > 180
+    assert pal.color(QPalette.ColorRole.PlaceholderText).lightness() < 200
+
+
 def test_obs_panel_shows_sensors(qapp):
     """ObsPanel 收带 sensors 的 obs 后树含传感器节点（T15）。"""
     from agentsim.gui.panels import ObsPanel

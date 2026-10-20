@@ -7,7 +7,9 @@ import subprocess
 
 import mujoco
 import numpy as np
+import pytest
 
+from agentsim.errors import WorldError
 from agentsim.kernel.sim import Simulation
 from agentsim.world.builder import build_world
 from agentsim.world.schema import load_world, parse_world
@@ -184,3 +186,59 @@ while robot.step():
         with Simulation(spec) as sim:
             stats = sim.run(max_ticks=20, stop_check=lambda: False)
         assert stats["ticks"] == 20
+
+
+class TestHandshake:
+    """握手等待期的鲁棒性（Windows 卡死病灶的回归守护）。
+
+    控制器进程活着但迟迟不发 hello 时，原先的握手循环会永久转圈：
+    run 不返回、stop_check 无人查、无任何报错。
+    """
+
+    def test_handshake_timeout_raises_and_kills(self, tmp_path, monkeypatch):
+        """握手超时：run 抛 WorldError（带控制器名），进程被终止不泄漏"""
+        monkeypatch.setattr("agentsim.kernel.sim._HANDSHAKE_TIMEOUT", 0.3)
+        ctrl_path = _write_controller(tmp_path, """
+import time
+time.sleep(60)          # 活着但永不握手
+""")
+        spec = parse_world(_world_dict(ctrl_path))
+        with Simulation(spec) as sim:
+            with pytest.raises(WorldError, match="握手超时.*arm"):
+                sim.run(max_ticks=10)
+            proc = sim._procs["arm"]
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                raise AssertionError("握手超时后控制器未被终止（泄漏）")
+
+    def test_stop_during_handshake_terminates(self, tmp_path):
+        """握手等待期停止：run 正常返回 stats（不抛），控制器被终止，
+        不计入 crashed（用户主动停止不是故障）"""
+        ctrl_path = _write_controller(tmp_path, """
+import time
+time.sleep(30)          # 握手前先睡：让 run 停在握手等待期
+""")
+        spec = parse_world(_world_dict(ctrl_path))
+        with Simulation(spec) as sim:
+            stats = sim.run(max_ticks=10, stop_check=lambda: True)
+            assert stats["ticks"] == 0
+            assert stats["crashed"] == []
+            proc = sim._procs["arm"]
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                raise AssertionError("握手期停止后控制器未被终止（泄漏）")
+
+    def test_controller_stderr_visible(self, tmp_path, capfd):
+        """控制器 stderr 不再被吞（直通继承内核 stderr）：起不来的
+        真实报错必须可见，这是 Windows 卡死可诊断的前提"""
+        ctrl_path = _write_controller(tmp_path, """
+import sys
+print("stderr-passthrough-check", file=sys.stderr)
+sys.exit(0)
+""")
+        spec = parse_world(_world_dict(ctrl_path))
+        with Simulation(spec) as sim:
+            sim.run(max_ticks=2)
+        assert "stderr-passthrough-check" in capfd.readouterr().err
