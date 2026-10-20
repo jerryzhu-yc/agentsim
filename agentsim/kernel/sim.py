@@ -24,8 +24,8 @@ import zmq
 
 from agentsim import supervisor
 from agentsim.errors import WorldError
-from agentsim.kernel.task import (robot_obs, sensors_obs, task_reward,
-                                  task_success)
+from agentsim.kernel.task import (robot_obs, root_freejoint_qadr,
+                                  sensors_obs, task_reward, task_success)
 from agentsim.world.builder import build_world, resolve_task
 from agentsim.world.schema import WorldSpec
 
@@ -262,6 +262,12 @@ class Simulation:
             "joint_names": list(ridx.joints), "qpos": qpos, "qvel": qvel,
             "bodies": bodies, "objects": objects,
         }
+        # 浮动基座躯干位姿（四足/人形）。匿名 free joint 不在 joints/qpos 里，
+        # 单独下发 [x,y,z,qw,qx,qy,qz]，GUI 渲染端据此写回 free joint；
+        # 固定基座机械臂无此键
+        qadr = root_freejoint_qadr(self.model, ridx)
+        if qadr is not None:
+            msg["root"] = [float(v) for v in self.data.qpos[qadr:qadr + 7]]
         # 传感器读数（声明过的机器人才有这个键；sensordata 在 mj_step 末尾已就绪；
         # 拼接语义见 kernel/task.py，与 RL env 共用）
         if ridx.sensors:

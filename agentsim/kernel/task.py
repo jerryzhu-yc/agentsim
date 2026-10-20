@@ -46,6 +46,26 @@ def joint_width(model: mujoco.MjModel, ridx: RobotIndex) -> tuple[int, int]:
     return qpos_w, qvel_w
 
 
+def root_freejoint_qadr(model: mujoco.MjModel, ridx: RobotIndex) -> int | None:
+    """浮动基座 root body 的 free joint qpos 地址；固定基座机器人返回 None。
+
+    关键：menagerie 四足/人形用匿名 <freejoint/>（j.name 为空），
+    _child_joint_names 只收命名关节，因此 ridx.joints 里没有它——
+    躯干 xyz+quat 不会进 qpos 观测，GUI 渲染端的浮动机器人就被锁在
+    出生位（四足"悬空奔跑"的根因）。这里按"world 直接子 body 上的
+    free 关节"单独定位。
+    """
+    for bid in ridx.bodies.values():
+        if int(model.body_parentid[bid]) != 0:
+            continue
+        n = int(model.body_jntnum[bid])
+        for k in range(n):
+            jid = int(model.body_jntadr[bid]) + k
+            if int(model.jnt_type[jid]) == int(mujoco.mjtJoint.mjJNT_FREE):
+                return int(model.jnt_qposadr[jid])
+    return None
+
+
 def robot_obs(ridx: RobotIndex, model: mujoco.MjModel,
               data: mujoco.MjData) -> tuple[list[float], list[float]]:
     """单机器人 qpos/qvel（按 RobotIndex.joints 声明顺序拼接）。"""

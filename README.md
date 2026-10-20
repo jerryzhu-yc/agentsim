@@ -411,12 +411,12 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 200 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 202 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop）/传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
 #              握手鲁棒性（超时终止/握手期停止/stderr 直通）/模型库/场景生成/
-#              GUI（含深色主题守护）/ M5 运动演示 / 位姿 quat 链路 / 代码编辑器 /
-#              Agent 控制台后端 /
+#              GUI（含深色主题守护、浮动基座 root 位姿同步）/ M5 运动演示 /
+#              位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
 #              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
 #              码垛分区 pallet / ur10e 入库
 ```
@@ -449,7 +449,7 @@ agentsim/
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
-└── tests/                 # 200 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
+└── tests/                 # 202 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
 ```
 
 ## Roadmap

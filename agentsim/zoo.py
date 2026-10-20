@@ -87,7 +87,9 @@ MODELS: dict[str, dict] = {
     # ---- 四足机器人 ----
     "unitree_go1": {
         "title": "Unitree Go1", "cat": "四足", "xml": "go1.xml",
-        "pos": [0, 0, 0.5], "desc": "宇树 Go1，12 关节（hip/thigh/calf × 4 腿）",
+        # 出生贴地（qpos0 姿态脚底 + 2mm 缓冲，同 go2 的算法）：
+        # 加载即四脚着地，Run 后直接压到站姿行走（原先 0.5 悬空）
+        "pos": [0, 0, 0.451], "desc": "宇树 Go1，12 关节（hip/thigh/calf × 4 腿）",
         # 位置执行器（kp=100 内置 PD）：小摆幅 + 膝滞后大，900 tick 走 10.8m
         # ramp=1：出生即全目标（空中收腿、落地即站姿）——渐入反而半直腿
         # 落地失稳（实测 RAMP=150 下 rootz 0.06 趴地）
@@ -99,7 +101,10 @@ MODELS: dict[str, dict] = {
                       lag={"hip": 0.0, "thigh": 0.0, "calf": 0.9})},
     "unitree_go2": {
         "title": "Unitree Go2", "cat": "四足", "xml": "go2.xml",
-        "pos": [0, 0, 0.5], "desc": "宇树 Go2，12 关节（hip/thigh/calf × 4 腿）",
+        # 出生贴地：qpos0 腿伸直时脚底（geom 半径 0.022）恰在 0.448，
+        # 取 0.45 留 2mm 数值缓冲——加载即四脚着地（原先 0.5 悬空，
+        # Run 后才落下）；ramp=1 出生即站姿目标，Run 后压到 0.28 行走
+        "pos": [0, 0, 0.45], "desc": "宇树 Go2，12 关节（hip/thigh/calf × 4 腿）",
         # ramp=1 同 go1：出生即全目标，落地即站姿。
         # implicitfast 下 freq2.0 趴地（rootz 0.06/1.07m）、freq2.4 最优
         # （rootz 0.28/6.50m）——积分器变更后网格重扫的实测值
@@ -110,8 +115,10 @@ MODELS: dict[str, dict] = {
                       freq=2.4, ramp=1)},
     "anybotics_anymal_c": {
         "title": "ANYmal C", "cat": "四足", "xml": "anymal_c.xml",
-        # 出生直腿贴 keyframe 会穿地 3cm（几何实测），抬高 5cm 悬空落下
-        "pos": [0, 0, 0.65], "desc": "ANYbotics 工业四足，12 关节",
+        # 出生贴地：qpos0 直腿脚底 0.632 + 2mm 缓冲——直腿站地上，Run
+        # 后收到 keyframe 站姿（腿缩短 ~3cm，躯干压低后开走）；
+        # 原先 0.65 悬空落下（qpos0 贴 keyframe 站姿会穿地 3cm，几何实测）
+        "pos": [0, 0, 0.634], "desc": "ANYbotics 工业四足，12 关节",
         # 原生执行器 kp100/kd0 压不住 50kg 机身（跟踪误差实测 ~1.0 rad，
         # 全参数网格都不走）——demo 补丁加 4 倍刚度 + 阻尼（同 h1 路径）。
         # hind_flip：前后腿镜像安装，后腿相位翻 π + 滞后取负才与 go1 同构
@@ -132,13 +139,15 @@ MODELS: dict[str, dict] = {
                 "act_patch": {"kp": [("", 400.0)], "kd": [("", 8.0)]}}},
     "boston_dynamics_spot": {
         "title": "Boston Dynamics Spot", "cat": "四足", "xml": "spot.xml",
-        # qpos0 原生即半蹲（hy 1.04/kn -1.8，躯干 0.75 脚悬空 5.7cm）。
+        # qpos0 原生即半蹲（hy 1.04/kn -1.8）。出生贴地：qpos0 姿态脚底
+        # 0.693 + 2mm 缓冲——qpos0 即 keyframe 站姿，出生即四脚着地，
+        # Run 后原地开走（原先 0.75 脚悬空 5.7cm 落下）。
         # 实测坑：①出生 0.50 压脚进地 19cm → 弹射 31m；②步态塌弹
         # （rootz 0.15-0.86，kp/kd/amp/freq/出生高度 30+ 组合无解）——
         # 根因是原生 solref=0.004 超硬接触被 attach 的默认 Euler 覆盖
         # 原生 implicitfast（"硬接触+显式积分=数值震荡"），修 integrator
-        # 后 rootz 0.47 稳定行走 3.16m；出生贴原生姿态 0.75 是最优起点
-        "pos": [0, 0, 0.75], "desc": "Spot 四足（带 arm 变体在 menagerie 里）",
+        # 后 rootz 0.47 稳定行走 3.16m
+        "pos": [0, 0, 0.695], "desc": "Spot 四足（带 arm 变体在 menagerie 里）",
         "demo": {**_trot(["fl", "fr", "hl", "hr"],
                          {"hip": "_hx", "thigh": "_hy", "calf": "_kn"},
                          # home = keyframe 站姿（出生即此姿态，RAMP 无操作）

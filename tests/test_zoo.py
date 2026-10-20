@@ -231,3 +231,66 @@ def test_demo_ur10e_registered_and_moves(tmp_path):
         assert dq > 0.1, f"关节最大变化 {dq:.3f} rad，未在运动"
     finally:
         s.close()
+
+
+# ------------------------------------------------ 浮动基座 root 位姿同步
+
+def test_floating_base_root_in_observation(tmp_path):
+    """四足观测带浮动基座 root [x,y,z,qw,qx,qy,qz]，且 run 后躯干 z 随
+    物理压低（不再锁在出生位）。匿名 free joint 不在 qpos 里，靠 root 键。"""
+    from agentsim.zoo import generate
+    from agentsim.mcp_server import AgentSimSession
+    r = generate("unitree_go2", out_dir=tmp_path / "root", demo=True)
+    s = AgentSimSession()
+    try:
+        s.call_tool("load_world", {"yaml_path": r["world"]})
+        obs0 = s.call_tool("get_observation", {})
+        rb0 = obs0["robots"]["unitree_go2"]
+        assert "root" in rb0 and len(rb0["root"]) == 7
+        assert len(rb0["qpos"]) == 12           # root 不混进 qpos
+        z0 = rb0["root"][2]
+        s.call_tool("run", {"ticks": 100})
+        z1 = s.call_tool("get_observation", {}) \
+            ["robots"]["unitree_go2"]["root"][2]
+        assert z1 < z0 - 0.05, (
+            f"躯干未随物理下落（出生 {z0:.3f} -> {z1:.3f}），root 可能没更新")
+    finally:
+        s.close()
+
+
+def test_render_model_follows_floating_root(tmp_path):
+    """GUI 渲染模型 apply_observation 后浮动基座躯干跟随 root（四足
+    "悬空奔跑"的回归守护：以前匿名 free joint 不同步，只有腿动）。"""
+    import mujoco
+    from agentsim.zoo import generate
+    from agentsim.world.schema import load_world
+    from agentsim.gui.render_view import RenderModel
+    r = generate("unitree_go2", out_dir=tmp_path / "render", demo=True)
+    spec = load_world(r["world"])
+    rm = RenderModel(spec, width=64, height=48)
+    try:
+        ridx = rm.index.robots["unitree_go2"]
+
+        def root_qadr():
+            for bid in ridx.bodies.values():
+                if int(rm.model.body_parentid[bid]) != 0:
+                    continue
+                for k in range(int(rm.model.body_jntnum[bid])):
+                    jid = int(rm.model.body_jntadr[bid]) + k
+                    if int(rm.model.jnt_type[jid]) == \
+                            int(mujoco.mjtJoint.mjJNT_FREE):
+                        return int(rm.model.jnt_qposadr[jid])
+            return None
+        qadr = root_qadr()
+        assert qadr is not None                # go2 必须有匿名 free joint
+        z_init = float(rm.data.qpos[qadr + 2])
+        fake_root = [0.0, 0.0, 0.276, 1.0, 0.0, 0.0, 0.0]
+        rm.apply_observation(
+            {"robots": {"unitree_go2": {
+                "root": fake_root,
+                "qpos": [0.0] * 12,
+                "joint_names": list(ridx.joints)}}})
+        assert float(rm.data.qpos[qadr + 2]) == pytest.approx(0.276)
+        assert abs(float(rm.data.qpos[qadr + 2]) - z_init) > 0.05
+    finally:
+        rm.close()

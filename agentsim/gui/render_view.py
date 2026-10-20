@@ -118,8 +118,25 @@ class RenderModel:
         """把 MCP get_observation 的 payload 写进 qpos（机器人+物体）。"""
         for rname, robs in (obs.get("robots") or {}).items():
             ridx = self.index.robots.get(rname)
+            if ridx is None:
+                continue
+            # 浮动基座躯干 [x,y,z,qw,qx,qy,qz]：menagerie 的匿名 free joint
+            # 不在 ridx.joints 里，必须单独写——否则四足/人形躯干被锁在
+            # 出生位（只有腿动），视觉上就是"原地悬空奔跑"
+            root = robs.get("root")
+            if root is not None:
+                for bid in ridx.bodies.values():
+                    if int(self.model.body_parentid[bid]) != 0:
+                        continue
+                    n = int(self.model.body_jntnum[bid])
+                    for k in range(n):
+                        jid = int(self.model.body_jntadr[bid]) + k
+                        if int(self.model.jnt_type[jid]) == \
+                                int(mujoco.mjtJoint.mjJNT_FREE):
+                            qadr = int(self.model.jnt_qposadr[jid])
+                            self.data.qpos[qadr:qadr + 7] = root
             qpos = robs.get("qpos") or []
-            if ridx is None or not qpos:
+            if not qpos:
                 continue
             src = 0
             for _jname, jid in ridx.joints.items():
