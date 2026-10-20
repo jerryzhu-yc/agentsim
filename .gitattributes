@@ -1,0 +1,2 @@
+# Windows 批处理必须 CRLF：cmd 对 LF-only 的 bat 在 label/goto 解析上有兼容坑
+*.bat text eol=crlf

@@ -76,6 +76,17 @@ python -m agentsim run worlds/pick_cube.yaml     # 跑一个内置任务
 python -m agentsim gui                            # 桌面工作台
 ```
 
+**4. 桌面快捷方式（可选，推荐）**：
+
+仓库根目录带两个批处理（UTF-8 中文输出，自动定位 Python，无需手动激活 venv）：
+
+```bat
+create_desktop_shortcut.bat    # 双击一次：在桌面生成 AgentSim 图标（agentsim.ico）
+start.bat                      # 双击即启动 GUI（快捷方式即指向它）
+```
+
+`start.bat` 按 `AGENTSIM_PYTHON` 环境变量 → 仓库内 `.venv` → PATH 里的 `python` → `py -3` 的顺序定位解释器；GUI 异常退出时窗口保留并提示装依赖，正常关闭时自动收窗。之后桌面双击 AgentSim 图标即可进入工作台，不用再开终端。
+
 **Windows 常见问题（FAQ）**：
 
 | 现象 | 处理 |
@@ -143,6 +154,8 @@ Agent 的标准闭环：`read_world` → 修改 YAML → `load_world(yaml_text)`
 pip install PySide6-Essentials   # GUI 可选依赖
 python -m agentsim gui
 ```
+
+> Windows 用户可免终端：双击仓库根的 `start.bat`，或先跑一次 `create_desktop_shortcut.bat` 生成桌面图标（见 [Windows 部署](#windows-部署)）。
 
 GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世界 YAML，后端经 stdio JSON-RPC 驱动同一个 `agentsim.mcp` 服务器——Run 时仿真跑在服务器后台线程，GUI 以 30Hz 拉取观测快照并渲染 MuJoCo 3D 画面 + 关节/物体面板。窗口里可以：
 
@@ -398,10 +411,12 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 193 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 200 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop）/传感器（含 bit 级轨迹守护）/
-#              RL 环境（含逐位一致性守护）/控制器心跳/模型库/场景生成/GUI/
-#              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
+#              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
+#              握手鲁棒性（超时终止/握手期停止/stderr 直通）/模型库/场景生成/
+#              GUI（含深色主题守护）/ M5 运动演示 / 位姿 quat 链路 / 代码编辑器 /
+#              Agent 控制台后端 /
 #              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
 #              码垛分区 pallet / ur10e 入库
 ```
@@ -432,7 +447,9 @@ agentsim/
 ├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
-└── tests/                 # 193 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
+├── start.bat / create_desktop_shortcut.bat / agentsim.ico
+│                            # Windows 双击启动 + 桌面快捷方式（项目图标）
+└── tests/                 # 200 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
 ```
 
 ## Roadmap
