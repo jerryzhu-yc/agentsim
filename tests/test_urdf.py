@@ -164,3 +164,43 @@ def test_world_yaml_with_urdf_robot(tmp_path):
     p.write_text(_URDF, encoding="utf-8")
     spec = parse_world(yaml.safe_load(_world_yaml(str(p))))
     assert spec.robots[0].model == str(p)
+
+
+# ================================================================ Windows 适配
+
+def _mesh_urdf(filename: str) -> str:
+    """base link 只有 mesh collision 的 URDF（懒加载：文件不存在也不报错）。"""
+    return _URDF.replace(
+        '<visual><geometry><box size="0.1 0.1 0.04"/></geometry></visual>\n'
+        '    <collision><geometry><box size="0.1 0.1 0.04"/></geometry></collision>',
+        f'<collision><geometry><mesh filename="{filename}" '
+        f'scale="1 1 1"/></geometry></collision>')
+
+
+def test_windows_drive_letter_path_kept(tmp_path):
+    """盘符绝对路径（C:/x、C:\\x）不与 urdf 目录拼接，原样保留。"""
+    for fn in ["C:/meshes/x.stl", "C:\\meshes\\x.stl"]:
+        p = tmp_path / "t.urdf"
+        p.write_text(_mesh_urdf(fn), encoding="utf-8")
+        spec = _load_robot_spec(p)
+        assert spec.meshes[0].file == "C:/meshes/x.stl", spec.meshes[0].file
+
+
+def test_windows_posix_slash_resolution(tmp_path):
+    """解析成功的 mesh 路径统一正斜杠（as_posix，Windows 反斜杠安全）。"""
+    _stl(tmp_path / "meshes_test.stl")
+    p = tmp_path / "t.urdf"
+    p.write_text(_mesh_urdf("meshes_test.stl"), encoding="utf-8")
+    spec = _load_robot_spec(p)
+    assert spec.meshes[0].file == (tmp_path / "meshes_test.stl").as_posix()
+    assert "\\" not in spec.meshes[0].file
+
+
+def test_gbk_encoded_urdf_readable(tmp_path):
+    """sw2urdf 在中文 Windows 可能写出 GBK：utf-8 失败自动回退 GBK。"""
+    p = tmp_path / "gbk.urdf"
+    p.write_bytes(_mesh_urdf("meshes_test.stl")
+                  .replace('name="mybot"', 'name="我的机器人"')
+                  .encode("gbk"))
+    spec = _load_robot_spec(p)               # 不抛 UnicodeDecodeError 即可
+    assert [a.name for a in spec.actuators] == ["j1"]

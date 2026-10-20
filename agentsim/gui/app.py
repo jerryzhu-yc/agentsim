@@ -1012,14 +1012,15 @@ class MainWindow(QMainWindow):
             self._log(f"导入模型 {p.name} 到当前场景"
                       f"（{'URDF' if p.suffix.lower() == '.urdf' else 'MJCF'}，"
                       f"未绑定控制器）", "ok")
-            self._append_robot_yaml(stem, str(p.resolve()),
+            # as_posix()：Windows 反斜杠路径进 YAML 统一正斜杠（跨平台安全）
+            self._append_robot_yaml(stem, p.resolve().as_posix(),
                                     float(lookat[0]), float(lookat[1]), z)
         else:
             # 无世界：新建仅含该机器人的世界（Ctrl+S 可另存）
             d = {"name": f"{stem}_import",
                  "floor": {},
                  "scene": {"objects": []},
-                 "robots": [{"name": stem, "model": str(p.resolve()),
+                 "robots": [{"name": stem, "model": p.resolve().as_posix(),
                              "pos": [0.0, 0.0, z]}]}
             text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
             self._log(f"导入模型 {p.name}：已生成新世界 {d['name']}", "ok")

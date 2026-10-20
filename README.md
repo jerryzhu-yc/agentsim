@@ -99,6 +99,7 @@ start.bat                      # 双击即启动 GUI（快捷方式即指向它�
 | 渲染报 `wgl` 相关错误（无 GPU 的服务器） | Windows Server 无 OpenGL 驱动，装 [Mesa3D 离屏驱动](https://mesa3d.org/)（或设 `MUJOCO_GL=osmesa`），或改用 Linux 容器跑无头测试 |
 | `mujoco-menagerie` 模型首次下载慢/失败 | 模型资产由 `mujoco-menagerie` 包从 GitHub 下载到 `~/.cache/mujoco_menagerie/`；网络受限时配代理（`HTTPS_PROXY` 环境变量），或先在有网机器上下载后拷贝缓存目录 |
 | 中文/空格路径 | 完全支持（pathlib 全程处理），但建议路径不含空格避免个别工具链问题 |
+| sw2urdf 导出的 URDF 导入后 mesh 报错 | mesh 路径按 urdf 所在目录解析（`package://` 前缀自动剥除）；编码兼容 UTF-8 与 GBK（中文 Windows 导出常见），确认 mesh 是 STL/OBJ 且 `<collision>` 里有几何 |
 
 **可选依赖**（都是 `pip install`，Windows 同样直接装）：
 
@@ -459,7 +460,7 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 228 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 231 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop/save_world 往返）/
 #              传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
@@ -470,7 +471,7 @@ python -m pytest tests/ -q
 #              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
 #              码垛分区 pallet / ur10e 入库 /
 #              URDF 导入（motor 自动补/mesh 相对与 package:// 解析/
-#              坏文件可读报错/编译冒烟）/
+#              坏文件可读报错/编译冒烟/盘符路径保留/GBK 编码兜底）/
 #              AI 场景生成（YAML 提取/zoo:// 替换/校验回喂重试/耗尽报错）
 ```
 

@@ -556,12 +556,15 @@ class AgentSimSession:
         except yaml.YAMLError:
             d = None
         if base and d:
-            # 相对资源改绝对（model/controller）
+            # 相对资源改绝对（model/controller）；as_posix 统一正斜杠
+            # （Windows 反斜杠进 YAML 跨平台重开也一致）
             def abs_of(v):
                 if not v:
                     return v
                 q = pathlib.Path(str(v))
-                return str(q) if q.is_absolute() else str((base / q).resolve())
+                if q.is_absolute():
+                    return q.as_posix()
+                return (base / q).resolve().as_posix()
             changed = False
             for r in d.get("robots") or []:
                 if r.get("model") and not pathlib.Path(str(r["model"])) \

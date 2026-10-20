@@ -111,7 +111,10 @@ def resolve_zoo_models(d: dict, on_download=None) -> dict:
 
     on_download(key)：下载前回调（首次联网下载可能数秒~数分钟）。
     就地修改并返回 d（链式）。未知 key 抛 WorldError（可读）。
+    路径统一正斜杠（as_posix）：Windows 反斜杠进 YAML 也安全。
     """
+    import pathlib
+
     from agentsim.zoo import MODELS, ensure_model
     for rd in d.get("robots") or []:
         model = rd.get("model", "")
@@ -123,7 +126,7 @@ def resolve_zoo_models(d: dict, on_download=None) -> dict:
                 f"AI 引用了未知模型库 key '{key}'，可用: {sorted(MODELS)}")
         if on_download:
             on_download(key)
-        rd["model"] = str(ensure_model(key))
+        rd["model"] = pathlib.Path(ensure_model(key)).as_posix()
     return d
 
 
