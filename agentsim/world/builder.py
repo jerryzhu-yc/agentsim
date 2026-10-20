@@ -272,7 +272,9 @@ def _assemble_robot_child(spec: WorldSpec,
     """
     model_path = _resolve_path(spec.base_dir, robot.model, "机器人模型")
     try:
-        child = mujoco.MjSpec.from_file(str(model_path))
+        child = _load_robot_spec(model_path)
+    except WorldError:
+        raise
     except Exception as e:
         raise WorldError(
             f"机器人 '{robot.name}' 模型解析失败 ({model_path}): {e}") from e
@@ -326,6 +328,59 @@ def _assemble_robot_child(spec: WorldSpec,
             b.pos[:] = [0.0, 0.0, 0.0]
             b.quat[:] = [1.0, 0.0, 0.0, 0.0]
     return child, act_names
+
+
+def _load_robot_spec(model_path: pathlib.Path) -> mujoco.MjSpec:
+    """读机器人模型：MJCF 直接读；URDF 做导入适配。
+
+    URDF 与 SolidWorks 工作流（sw2urdf 插件导出）的差异由这里吸收：
+    - mesh 路径：MuJoCo 的 from_string 无文件目录上下文，先把全部
+      mesh filename 重写为基于 urdf 所在目录的绝对路径；package://NAME/REST
+      按 REST / NAME/REST 两级就近查找（sw2urdf 的导出目录惯例）
+    - 执行器：URDF 没有 <actuator>（transmission 少有人写），每个关节
+      自动补一个同名 motor（力矩控制，agentsim 的 ctrl 直写语义）
+
+    注意：MuJoCo 的 URDF 解析只用 <collision>，<visual> 全部忽略——
+    SolidWorks 导出时确保零件有碰撞几何（sw2urdf 默认会生成）。
+    """
+    if model_path.suffix.lower() != ".urdf":
+        return mujoco.MjSpec.from_file(str(model_path))
+
+    import re
+    text = model_path.read_text(encoding="utf-8")
+    base = model_path.parent
+
+    def _resolve(m):
+        fn = m.group(1)
+        if fn.startswith("/"):                      # 已是绝对路径
+            return fn
+        fn = re.sub(r"^(package|file)://", "", fn)  # sw2urdf 惯例前缀
+        # package://NAME/REST：先按原相对结构找，再按 NAME 目录下找
+        cands = [base / fn]
+        parts = fn.split("/", 1)
+        if len(parts) == 2 and parts[1]:
+            cands.append(base / parts[0] / parts[1])
+        for c in cands:
+            if c.is_file():
+                return str(c.resolve())
+        return fn                                   # 找不到保持原样（报错可读）
+
+    text = re.sub(r'filename="([^"]+)"',
+                  lambda m: f'filename="{_resolve(m)}"', text)
+    try:
+        child = mujoco.MjSpec.from_string(text)
+    except Exception as e:
+        raise WorldError(
+            f"URDF 解析失败 ({model_path}): {e}\n"
+            f"（提示：MuJoCo 只读取 URDF 的 <collision>；mesh 仅支持 "
+            f"STL/OBJ）") from e
+    # URDF 无执行器：逐关节补 motor（URDF 解析器已把 fixed joint 合并，
+    # joints 列表里全是可动关节）
+    for j in child.joints:
+        child.add_actuator(name=j.name,
+                           trntype=int(mujoco.mjtTrn.mjTRN_JOINT),
+                           target=j.name)
+    return child
 
 
 def _attach_robot(spec: WorldSpec, robot: RobotSpec, mj: mujoco.MjSpec) -> None:

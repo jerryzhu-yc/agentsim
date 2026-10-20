@@ -571,3 +571,144 @@ def test_new_scene_dialog_selection(qapp):
         assert set(params) == {"rows", "cols"}
     finally:
         dlg.deleteLater()
+
+
+# ================================================================ 导入模型贴地
+
+_URDF_FIXTURE = """<?xml version="1.0"?>
+<robot name="mybot">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+    <collision><geometry><box size="0.1 0.1 0.04"/></geometry></collision>
+  </link>
+  <link name="arm">
+    <inertial><origin xyz="0.1 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0.1 0 0"/>
+      <geometry><box size="0.2 0.03 0.03"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="arm"/>
+    <origin xyz="0 0 0.03" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="2"/>
+  </joint>
+</robot>
+"""
+
+
+def test_import_spawn_z_urdf(tmp_path):
+    """导入贴地高度：qpos0 最低点（base 底 -0.02）+ 2mm 缓冲。"""
+    from agentsim.gui.app import _import_spawn_z
+    p = tmp_path / "mybot.urdf"
+    p.write_text(_URDF_FIXTURE, encoding="utf-8")
+    assert _import_spawn_z(p) == pytest.approx(0.022)
+
+
+def test_import_spawn_z_mjcf(tmp_path):
+    """MJCF 同样适用：root body 自带 pos 被 builder 规则清零，按相对
+    几何算——box 半高 0.02 -> 0.022（与 URDF 同理）。"""
+    from agentsim.gui.app import _import_spawn_z
+    p = tmp_path / "bot.xml"
+    p.write_text(
+        "<mujoco><worldbody>"
+        '<body name="b" pos="0 0 0.3"><geom type="box" size=".1 .1 .02"/>'
+        '<joint name="j" type="slide" axis="0 0 1"/>'
+        "</body></worldbody>"
+        '<actuator><motor name="m" joint="j"/></actuator></mujoco>',
+        encoding="utf-8")
+    assert _import_spawn_z(p) == pytest.approx(0.022)
+
+
+def test_import_spawn_z_plane_skipped(tmp_path):
+    """模型自带 plane（如整场景 MJCF）：无限大平面不参与贴地计算。
+
+    plane 挂在 z=-1：若未跳过会得到 spawn=1.002，跳过则按球体 0.052。
+    """
+    from agentsim.gui.app import _import_spawn_z
+    p = tmp_path / "with_plane.xml"
+    p.write_text(
+        "<mujoco><worldbody>"
+        '<geom name="ground" type="plane" size="5 5 0.1" pos="0 0 -1"/>'
+        '<body name="b"><geom type="sphere" size="0.05"/>'
+        '<joint name="j" type="slide" axis="0 0 1"/>'
+        "</body></worldbody>"
+        '<actuator><motor name="m" joint="j"/></actuator></mujoco>',
+        encoding="utf-8")
+    # 最低点只算球体：0 - 0.05 + 0.002
+    assert _import_spawn_z(p) == pytest.approx(0.052)
+
+
+# ================================================================ AI 场景生成对话框
+
+def _wait_worker(qapp, dlg, timeout_s=5.0):
+    """等 worker 线程结束并派发排队信号（跨线程信号需事件循环）。"""
+    import time
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if dlg._worker is None:              # 失败路径已复位
+            return
+        if not dlg._worker.isRunning():
+            time.sleep(0.02)                 # 收尾缓冲：残余排队信号
+            qapp.processEvents()
+            return
+        time.sleep(0.01)
+    qapp.processEvents()
+
+
+def test_scene_agent_dialog_flow(qapp, monkeypatch):
+    """空输入提示；生成成功发 generated 信号并带 note。"""
+    from agentsim.agent import AgentConfig
+    from agentsim.gui.app import SceneAgentDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        # 空输入：仅提示不启动 worker
+        dlg._on_generate()
+        assert dlg.status.text().startswith("先输入")
+        assert dlg._worker is None
+        # 正常输入 + 打桩 generate_scene（含 zoo 下载回调）
+        dlg.input.setPlainText("一只机器狗")
+        seen = []
+
+        def fake_gen(req, c, on_download=None):
+            seen.append((req, on_download is not None))
+            if on_download:
+                on_download("unitree_go2")
+            return ("name: ok\nfloor: {}\n", "已生成简单场景")
+
+        import agentsim.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "generate_scene", fake_gen)
+        got = []
+        dlg.generated.connect(got.append)
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert seen == [("一只机器狗", True)]
+        assert got == ["name: ok\nfloor: {}\n"]
+        assert dlg.note == "已生成简单场景"
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_failure(qapp, monkeypatch):
+    """生成失败：状态栏显示错误，worker 复位可再试。"""
+    from agentsim.agent import AgentConfig
+    from agentsim.gui.app import SceneAgentDialog
+    from agentsim.agent.scene_agent import SceneGenError
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        dlg.input.setPlainText("需求")
+        import agentsim.agent as agent_pkg
+        monkeypatch.setattr(
+            agent_pkg, "generate_scene",
+            lambda req, c, on_download=None: (_ for _ in ()).throw(
+                SceneGenError("LLM 服务不可达")))
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert "生成失败" in dlg.status.text()
+        assert "不可达" in dlg.status.text()
+        assert dlg._worker is None
+    finally:
+        dlg.deleteLater()

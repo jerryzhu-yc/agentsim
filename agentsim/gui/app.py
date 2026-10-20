@@ -23,14 +23,14 @@ import json
 
 import numpy as np
 import yaml
-from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QDialog, QDockWidget, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QPushButton, QSpinBox,
-                               QTabWidget, QVBoxLayout, QWidget)
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTabWidget, QVBoxLayout)
 
 from agentsim.gui import theme
 from agentsim.gui.mcp_client import McpClient
@@ -41,6 +41,47 @@ from agentsim.gui.render_view import RenderView, _CAM_PRESETS
 from agentsim.gui.state import UiState
 from agentsim.world.schema import load_world as parse_world_file
 from agentsim.world.schema import parse_world
+
+
+def _import_spawn_z(p) -> float:
+    """qpos0 姿态最低几何点 -> 贴地出生高度（+2mm 缓冲）。
+
+    与 builder 同规则先把 root body 位姿清零再编译，保证这里的相对
+    高度与最终挂载进世界后一致（含浮动基座 freejoint 情形）。
+    """
+    import itertools
+
+    import mujoco
+    from agentsim.world.builder import _load_robot_spec
+    spec = _load_robot_spec(p)
+    for b in spec.bodies:
+        if b.parent is spec.worldbody:
+            b.pos[:] = [0.0, 0.0, 0.0]
+            b.quat[:] = [1.0, 0.0, 0.0, 0.0]
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    zmin = float("inf")
+    for gid in range(model.ngeom):
+        gtype = model.geom_type[gid]
+        if gtype == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue                      # 无限大地板不参与
+        pos = data.geom_xpos[gid]
+        if gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+            z = pos[2] - model.geom_size[gid][0]
+        elif gtype == mujoco.mjtGeom.mjGEOM_BOX:
+            # 半边长盒的 8 个角点旋转到世界取最低（精确）
+            s = model.geom_size[gid]
+            corners = (np.array(list(itertools.product((-1, 1), repeat=3)))
+                       * s[:3])
+            world = corners @ data.geom_xmat[gid].reshape(3, 3).T + pos
+            z = float(world[:, 2].min())
+        else:                              # cylinder/mesh 等：包围球保守
+            z = pos[2] - model.geom_rbound[gid]
+        zmin = min(zmin, z)
+    if zmin == float("inf"):
+        return 0.0                         # 无几何体（罕见）
+    return round(-zmin + 0.002, 4)
 
 
 class ZooDialog(QDialog):
@@ -115,7 +156,6 @@ class ZooDialog(QDialog):
 
 class NewSceneDialog(QDialog):
     """新建场景：选参数化模板 -> 生成世界 YAML（含码垛分区 pallet）。"""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("新建场景")
@@ -178,6 +218,116 @@ class NewSceneDialog(QDialog):
         return key, params
 
 
+class _SceneGenWorker(QThread):
+    """后台跑 generate_scene（HTTP + zoo 下载），不阻塞对话框 UI。"""
+
+    statusChanged = Signal(str)
+    generated = Signal(str, str)            # (yaml_text, LLM 说明)
+    failed = Signal(str)
+
+    def __init__(self, requirement: str, cfg, parent=None):
+        super().__init__(parent)
+        self._req = requirement
+        self._cfg = cfg
+        self._stop = False
+
+    def stop(self):
+        self._stop = True                   # 只置位：HTTP 中途不可打断
+
+    def run(self):
+        from agentsim.agent import generate_scene
+        try:
+            def on_dl(key):
+                self.statusChanged.emit(f"首次使用 {key}，联网下载模型…")
+            self.statusChanged.emit("LLM 生成中…")
+            text, note = generate_scene(self._req, self._cfg,
+                                        on_download=on_dl)
+            if self._stop:
+                return
+            self.generated.emit(text, note)
+        except Exception as e:
+            if not self._stop:
+                self.failed.emit(str(e))
+
+
+class SceneAgentDialog(QDialog):
+    """AI 场景生成：自然语言需求 -> 世界 YAML（生成-校验-重试闭环）。"""
+
+    generated = Signal(str)                # 生成成功（世界 YAML 文本）
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI 生成场景")
+        self.resize(560, 420)
+        self._cfg = cfg
+        self._worker: _SceneGenWorker | None = None
+
+        lay = QVBoxLayout(self)
+        tip = QLabel("用一句话描述你想要的场景（机器人、物体、任务），"
+                     "AI 直接生成对应的世界 YAML 并本地校验，失败自动重试。\n"
+                     "例：一只 Go2 四足机器狗站在 3x3 米场地中央，"
+                     "面前 1 米处放一个红色方块。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("描述你的场景需求…")
+        lay.addWidget(self.input, stretch=2)
+
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#9CA3AF;")
+        lay.addWidget(self.status)
+
+        row = QHBoxLayout()
+        btn_gen = QPushButton("生成")
+        btn_gen.setObjectName("primary")
+        btn_gen.setDefault(True)
+        btn_gen.clicked.connect(self._on_generate)
+        row.addWidget(btn_gen)
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self._on_close)
+        row.addWidget(self.btn_close)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _on_generate(self):
+        text = self.input.toPlainText().strip()
+        if not text:
+            self.status.setText("先输入需求描述。")
+            return
+        self.status.setText("LLM 生成中…")
+        self.btn_close.setText("取消")
+        self._worker = _SceneGenWorker(text, self._cfg, self)
+        self._worker.statusChanged.connect(self.status.setText)
+        self._worker.generated.connect(self._on_generated)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_generated(self, yaml_text: str, note: str):
+        self.status.setText("生成成功，正在加载世界…")
+        self.note = note.strip()            # app 侧取走记入控制台
+        self.generated.emit(yaml_text)
+        self.accept()
+
+    def _on_failed(self, err: str):
+        self.status.setText(f"生成失败：{err}")
+        self.btn_close.setText("关闭")
+        self._worker = None
+
+    def _on_close(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            self.status.setText("正在取消…")
+            return
+        self.reject()
+
+    def closeEvent(self, e):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+        super().closeEvent(e)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -229,9 +379,24 @@ class MainWindow(QMainWindow):
         self.gear.remove_sensor.connect(self._on_gear_remove_sensor)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.props, "属性")
-        self.tabs.addTab(self.obs, "观测")
-        self.tabs.addTab(self.gear, "装备")
+
+        def _scrollable(panel):
+            """面板包滚动区：内容再多也不锁死 dock 最小宽度——
+
+            装备页表单（夹爪 pos/quat 六七个 spin 并排）minimumSizeHint
+            高达 500+px，旧版把右侧 dock 顶到 510 拖不动，仿真视口被挤
+            到 480 以下还放大不了（用户拖分隔条"没效果"的根因）。
+            """
+            from PySide6.QtWidgets import QScrollArea
+            sa = QScrollArea()
+            sa.setWidget(panel)
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QScrollArea.Shape.NoFrame)
+            return sa
+
+        self.tabs.addTab(_scrollable(self.props), "属性")
+        self.tabs.addTab(_scrollable(self.obs), "观测")
+        self.tabs.addTab(_scrollable(self.gear), "装备")
         self.tabs.addTab(self.code, "代码")
         self.tabs.addTab(self.agent, "Agent")
 
@@ -254,7 +419,7 @@ class MainWindow(QMainWindow):
                                           Qt.DockWidgetArea.RightDockWidgetArea)
         self.dock_console = self._make_dock("控制台", self.console,
                                             Qt.DockWidgetArea.BottomDockWidgetArea)
-        self.dock_right.setMinimumWidth(300)
+        self.dock_right.setMinimumWidth(240)   # 可拖更窄（内容出滚动条）
         self.resizeDocks([self.dock_scene, self.dock_right], [280, 340],
                          Qt.Orientation.Horizontal)
         self.resizeDocks([self.dock_console], [200], Qt.Orientation.Vertical)
@@ -301,6 +466,15 @@ class MainWindow(QMainWindow):
         self.act_new_scene = mk("新建场景…", "Ctrl+N", "从参数化模板生成场景"
                                 "（含码垛分区 pallet）")
         self.act_zoo = mk("机器人模型库…", "Ctrl+M", "从官方模型库生成项目")
+        self.act_import = mk("导入模型…", "Ctrl+I",
+                             "导入本地机器人模型（URDF / MJCF）到当前场景"
+                             "或新世界——SolidWorks 经 sw2urdf 插件导出的 "
+                             "URDF 直接可用")
+        self.act_import.triggered.connect(self._on_import_model)
+        self.act_scene_agent = mk("AI 生成场景…", "Ctrl+G",
+                                  "自然语言描述需求，AI 直接生成世界 YAML"
+                                  "（本地校验 + 失败自动重试）")
+        self.act_scene_agent.triggered.connect(self._on_scene_agent)
         self.act_save = mk("保存世界", "Ctrl+S",
                            "把当前世界（含拖动/位姿/装备等全部修改）"
                            "写回 YAML 文件")
@@ -357,6 +531,8 @@ class MainWindow(QMainWindow):
         self._recent_menu = m_file.addMenu("最近打开")
         m_file.addAction(self.act_new_scene)
         m_file.addAction(self.act_zoo)
+        m_file.addAction(self.act_import)
+        m_file.addAction(self.act_scene_agent)
         m_file.addSeparator()
         m_file.addAction(self.act_save)
         m_file.addSeparator()
@@ -638,6 +814,37 @@ class MainWindow(QMainWindow):
             "load_world", {"yaml_path": str(out)},
             lambda e, d: self._on_loaded(e, d, spec, str(out)))
 
+    def _on_scene_agent(self):
+        """AI 生成场景：自然语言 -> LLM 世界 YAML -> 本地校验重试 -> 加载。"""
+        if self._edit_blocked("AI 生成场景"):
+            return
+        from agentsim.agent import load_config, save_config
+        cfg = load_config()
+        if not cfg.usable:
+            QMessageBox.information(
+                self, "AI 生成场景",
+                "先配置 LLM 端点（OpenAI / DeepSeek / GLM / Ollama 等，"
+                "OpenAI 兼容 chat/completions 协议）。")
+            from agentsim.gui.panels import AgentConfigDialog
+            dlg_cfg = AgentConfigDialog(self)
+            if dlg_cfg.exec() != QDialog.DialogCode.Accepted:
+                return
+            cfg = dlg_cfg.config()
+            save_config(cfg)
+            if not cfg.usable:
+                return
+        dlg = SceneAgentDialog(cfg, self)
+        dlg.generated.connect(self._on_scene_generated)
+        dlg.exec()
+
+    def _on_scene_generated(self, text: str):
+        """AI 场景生成成功：全量加载（模型路径均绝对，Ctrl+S 另存为新文件）。"""
+        self._world_path = None          # 不覆盖旧世界文件：Ctrl+S 会问另存位置
+        note = getattr(self.sender(), "note", "") or ""
+        if note:
+            self._log(f"AI 场景说明：{note[:300]}", "ok")
+        self._reload_yaml(text, ok_msg="AI 场景已生成并加载（Ctrl+S 保存）")
+
     def _on_screenshot(self):
         if self.view._frame is None:
             QMessageBox.information(self, "导出截图", "还没有可保存的视口画面。")
@@ -768,6 +975,56 @@ class MainWindow(QMainWindow):
             self._log(f"添加机器人 {name}（模型 {key}，未绑定控制器；"
                       f"需要控制律请用 模型库 → 生成并打开）", "ok")
         self.client.call_tool("read_world", {}, got_yaml)
+
+    # ============================================================ 导入模型
+
+    def _on_import_model(self):
+        """导入本地机器人模型（.urdf / .xml）：加到当前世界或新建世界。
+
+        URDF 适配（mesh 路径重写 / package:// 剥前缀 / 自动补 motor）由
+        builder._load_robot_spec 统一吸收，这里先本地校验 + 算贴地高度，
+        避免明显坏文件走到后端才报错。
+        """
+        if self._edit_blocked("导入模型"):
+            return
+        import pathlib
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入机器人模型（URDF / MJCF）", "",
+            "机器人模型 (*.urdf *.xml);;URDF (*.urdf);;MJCF (*.xml)")
+        if not path:
+            return
+        p = pathlib.Path(path)
+        stem = p.stem or "robot"
+        try:
+            z = _import_spawn_z(p)
+        except Exception as e:
+            self._apply_state(f"导入失败: {e}")
+            self._log(f"导入模型失败 {p}: {e}", "error")
+            QMessageBox.critical(self, "导入模型", f"模型解析失败：\n{e}\n\n"
+                                "URDF 提示：MuJoCo 只读 <collision> 几何，"
+                                "mesh 仅支持 STL/OBJ。")
+            return
+
+        if self._spec is not None:
+            # 已有世界：追加到相机注视点（复用"添加机器人"整链）
+            lookat = (self.view.rm.cam.lookat if self.view.rm is not None
+                      else (0.0, 0.0, 0.0))
+            self._log(f"导入模型 {p.name} 到当前场景"
+                      f"（{'URDF' if p.suffix.lower() == '.urdf' else 'MJCF'}，"
+                      f"未绑定控制器）", "ok")
+            self._append_robot_yaml(stem, str(p.resolve()),
+                                    float(lookat[0]), float(lookat[1]), z)
+        else:
+            # 无世界：新建仅含该机器人的世界（Ctrl+S 可另存）
+            d = {"name": f"{stem}_import",
+                 "floor": {},
+                 "scene": {"objects": []},
+                 "robots": [{"name": stem, "model": str(p.resolve()),
+                             "pos": [0.0, 0.0, z]}]}
+            text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
+            self._log(f"导入模型 {p.name}：已生成新世界 {d['name']}", "ok")
+            self._reload_yaml(
+                text, ok_msg=f"已导入 {p.name} 为新世界（Ctrl+S 保存）")
 
     # ============================================================ 编辑提交
 

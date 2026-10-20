@@ -37,6 +37,8 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 - **RL 训练接口**：一个 YAML 世界 = 一个确定性 gymnasium.Env——动作空间 = 执行器拼接、观测 = qpos/qvel/传感器、reset 逐位一致（同 YAML 跑两遍轨迹逐 bit 相同，eval 可复现），单进程直驱不起 ZMQ，训练吞吐优先
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
 - **场景生成器**：6 个确定性模板（tabletop / push / maze / race / pallet / empty），同一命令 + 同一参数 = 逐字节相同的输出
+- **AI 场景生成**：自然语言需求 → LLM 直接生成世界 YAML → 本地 schema+编译双重校验，失败自动回喂重试（Ctrl+G）；机器人经 `zoo://key` 引用模型库，无需知道任何文件路径
+- **URDF / SolidWorks 导入**：`robots[].model` 直接填 `.urdf` 路径——mesh 路径重写、`package://` 前缀剥除、逐关节自动补 motor 全部自动；SolidWorks 装 sw2urdf 插件导出即可用
 - **零重量依赖**：核心只依赖 mujoco / numpy / pyyaml / pyzmq，MCP 层不依赖任何 SDK
 
 ## 安装
@@ -163,6 +165,8 @@ GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世�
 - **模型库**：选 Menagerie 官方模型（首次联网下载一次）→ 自动生成世界 + 控制器模板 → 自动加载并打开编辑器——点击-打开-编程闭环
 - **装备页**：选中机器人后点选即可装配/移除 OnRobot 2FG7 夹爪（UR5e/UR10e/xArm7/Panda），并按类型表单添加/删除五类传感器——所有改动写回世界 YAML 并自动重载，无需手写
 - **新建场景**（文件 → 新建场景，Ctrl+N）：选参数化模板（含码垛分区 pallet）→ 设参数 → 保存即生成并加载
+- **AI 生成场景**（文件 → AI 生成场景，Ctrl+G）：一句话描述需求（"一只 Go2 站在 3x3 场地中央，面前放个红方块"）→ LLM 直接生成世界 YAML → 本地 schema+编译双重校验，失败自动把错误喂回重试 → 通过即加载；机器人引用模型库写 `zoo://key` 自动解析成缓存路径（首次联网下载一次）。需先在 Agent 页配置任意 OpenAI 兼容端点（DeepSeek/GLM/Ollama 均可）
+- **导入模型**（文件 → 导入模型，Ctrl+I）：选本地 `.urdf` / `.xml` 机器人模型导入当前场景或新世界——URDF 自动适配（mesh 相对路径按 urdf 目录解析、`package://` 前缀剥除、逐关节自动补 motor）、贴地出生高度自动计算，SolidWorks 工作流见 [导入 URDF（含 SolidWorks）](#导入-urdf含-solidworks)
 - **保存世界**（Ctrl+S）：拖动/位姿/装备/添加机器人等全部修改写回 YAML 文件——改完的世界可以留到下次（内存世界会提示另存位置；跨目录保存时相对资源路径自动改绝对）
 - **最近打开**（文件菜单）：最近 8 个世界一键重开（跨会话持久化）
 - **添加物体 / 删除节点**（场景菜单）：往场景加方块/圆柱/球（类型/尺寸/颜色，放在相机注视点）；场景树右键或 Del 键删除选中的机器人/物体——搭场景不用手写 YAML
@@ -170,7 +174,7 @@ GUI 本身就是一个 MCP 客户端（与 AI Agent 同构）：左键加载世�
 - **Run / Run N**：跑一整个 episode（结束后可再 Run，自动 reset）
 - **停止**：run 进行中随时可点（F6）——提前收尾当前 run，控制器正常退出、已跑轨迹保留，之后照常 Reset / 继续 Run
 - **实时勾选框**：勾选=按墙钟实时播放动画（1 仿真秒≈1 墙钟秒，MCP `run` 的 `realtime` 参数）；取消=全速推进瞬间出结果（跑批验证）
-- **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放、**F 键聚焦选中对象**
+- **Reset**：世界回初态；渲染视角支持鼠标拖拽旋转、滚轮缩放、**F 键聚焦选中对象**；属性/观测/装备面板带滚动条，右停靠栏可自由拖窄放大视口
 
 > run 期间 `get_observation` 返回 33ms 节流的运动学快照（含物体位置 + 四元数），不影响物理轨迹。
 
@@ -347,6 +351,39 @@ tools.run(ticks=200)
 
 > 已知语义：attach 时子模型的 MuJoCo option（impratio / cone 等）被父世界值覆盖——接触求解参数以世界 YAML 为准（`worlds/zoo` 生成模板已按各模型类目调好 floor 摩擦）。
 
+## 导入 URDF（含 SolidWorks）
+
+世界 YAML 的 `robots[].model` 直接支持 `.urdf`（也支持 `.xml` MJCF）——GUI 走 文件 → 导入模型（Ctrl+I），YAML 手写直接填路径即可：
+
+```yaml
+robots:
+  - name: my_arm
+    model: /path/to/my_robot.urdf   # 或相对世界文件目录的路径
+    pos: [0, 0, 0]
+```
+
+URDF 与 MJCF 的差异由导入层（`agentsim/world/builder.py` 的 `_load_robot_spec`）统一吸收：
+
+- **mesh 路径**：相对路径按 urdf 文件所在目录解析；`package://NAME/REST` 前缀自动剥除并两级就近查找（ROS / sw2urdf 导出目录惯例）；找不到时报错带原文件名
+- **执行器**：URDF 没有 `<actuator>`，每个可动关节自动补一个同名 motor（力矩控制，`ctrl` 直写）；`fixed joint` 在解析时已合并进父 body
+- **贴地出生**：GUI 导入时按 qpos0 姿态最低几何点 + 2mm 缓冲自动算出生高度（box 精确到角点、cylinder/mesh 用包围球保守估计）
+
+**SolidWorks 工作流**：装 [sw2urdf](https://github.com/ros/solidworks_urdf_exporter) 插件 → 装配体导出 URDF → GUI 导入选导出的 `.urdf` 即可。注意两点：
+
+1. MuJoCo 的 URDF 解析**只读 `<collision>` 几何，忽略 `<visual>`**——SolidWorks 零件导出时确保勾选碰撞几何（sw2urdf 默认生成）
+2. mesh 仅支持 STL / OBJ 格式（sw2urdf 默认导出 STL，无需转换）
+
+导入后机器人未绑定控制器（纯场景摆放），需要控制律时用"代码页"写或让 AI 生成；MJCF（`.xml`）导入行为不变，与旧版完全兼容。
+
+## AI 场景生成 Agent
+
+文件 → AI 生成场景（Ctrl+G）：自然语言需求 → LLM 生成世界 YAML → 本地校验 → 加载，与参数化模板（`scenegen`）、手写 YAML 三条路径并存。
+
+- **生成闭环**（`agentsim/agent/scene_agent.py`）：LLM 输出 → 剥围栏提取 YAML → `parse_world` schema 校验 + `build_world` 编译校验 → 失败把可读错误喂回 LLM 重试（默认 3 次）→ 通过即加载
+- **模型引用**：prompt 注入完整模型库清单，LLM 写 `zoo://unitree_go2` 引用 → 本地自动解析成 menagerie 缓存绝对路径（首次联网下载一次）
+- **配置复用**：与 Agent 控制台共用 `~/.agentsim/agent.json`（任意 OpenAI 兼容端点：OpenAI / DeepSeek / GLM / Ollama / vLLM）
+- **保留手动路径**：AI 生成不取代手写——模板（`scenegen`）、手写 YAML、导入模型全部保留，AI 只是多一条"说一句话就出场景"的捷径
+
 ## 桌面 GUI 智能工作台（M5）
 
 GUI（`python -m agentsim gui`）从可视化扩展为完整的机器人编程工作台——左右四块面板（场景树/属性/代码/Agent），配合模型库的运动演示与位姿编辑，覆盖"打开/写代码/调位姿/跑/让 AI 来"全闭环。
@@ -422,16 +459,19 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 206 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 228 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop/save_world 往返）/
 #              传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
 #              握手鲁棒性（超时终止/握手期停止/stderr 直通）/模型库/场景生成/
 #              GUI（含深色主题守护、浮动基座 root 位姿同步、三维拖动/
-#              FINISHED 可编辑/添加物体对话框）/ M5 运动演示 /
-#              位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
+#              FINISHED 可编辑/添加物体对话框/AI 场景对话框/导入贴地高度）/
+#              M5 运动演示 / 位姿 quat 链路 / 代码编辑器 / Agent 控制台后端 /
 #              M6 2FG7 夹爪（四臂装配/索引/物理开合/触觉挂手指）/ 装备面板 /
-#              码垛分区 pallet / ur10e 入库
+#              码垛分区 pallet / ur10e 入库 /
+#              URDF 导入（motor 自动补/mesh 相对与 package:// 解析/
+#              坏文件可读报错/编译冒烟）/
+#              AI 场景生成（YAML 提取/zoo:// 替换/校验回喂重试/耗尽报错）
 ```
 
 其中包含真实 Agent 压测回归：控制器在 LLM 思考时间下存活、崩溃控制器在统计中可见、每轮 run 零进程泄漏。M5 新增 13 项测试覆盖 demo 生成（全覆盖 + go2 600 tick 行走 >1m + panda 关节活动度）、quat 链路（attach + 欧拉↔四元数 roundtrip + 属性面板应用）、PyHighlighter 四类着色 + CodePanel 保存信号、Agent 后端（config 0600 + chat_url 兼容 + MCP↔OpenAI 工具转换 + 本地文件越界防护）。停止功能另加 5 项：内核 `stop_check` 三态（带控制器提前收尾不泄漏 / 无控制器空跑可停 / 恒 False 行为不变）、MCP stop 工具（run 中停止 + 无 run 无操作）、GUI 状态机（停止仅 RUNNING 可用）。
@@ -452,7 +492,8 @@ agentsim/
 │   ├── supervisor.py      # 快照/teleport（逐位可复现）
 │   ├── mcp_server.py      # MCP stdio 服务器（零依赖 JSON-RPC）
 │   ├── render.py          # 离屏渲染 + 手写 PNG 编码（screenshot 实现层）
-│   ├── agent/             # GUI Agent 控制台后端（config/bridge/local_tools/worker）
+│   ├── agent/             # GUI Agent 控制台后端（config/bridge/local_tools/
+│   │                        # worker）+ scene_agent（AI 场景生成闭环）
 │   ├── gui/               # PySide6 桌面工作台（app/render_view/panels[含装备页]/mcp_client）
 │   ├── scene_gen.py       # 6 个确定性场景模板（含码垛分区 pallet）
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
@@ -462,7 +503,7 @@ agentsim/
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
-└── tests/                 # 206 项测试（含 M6 夹爪装配/装备面板/码垛场景/ur10e）
+└── tests/                 # 228 项测试（含 URDF 导入/AI 场景生成/夹爪/码垛）
 ```
 
 ## Roadmap
@@ -475,6 +516,7 @@ agentsim/
 - [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（14 个预配置著名机器人，M6 新增 UR10e），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
 - [x] M5 运动演示与智能工作台 —— 14 个模型一键运动演示（四足 trot / 机械臂扫掠 / 人形摆臂）+ GUI 位姿编辑面板（xyz+欧拉角）+ 内置 Python 代码编辑器（保存并运行）+ Agent 控制台（OpenAI 兼容 chat API 调用，AI 直接生成场景/写代码/运行验证）+ PPO 训练示例（`examples/train_ppo_go2.py`）
 - [x] M6 夹具/传感器装配工作台 —— OnRobot 2FG7 夹爪入库（site-attach 到 UR5e/UR10e/xArm7/Panda，mount 对四臂统一标定并与官方参考场景逐位吻合）+ GUI"装备"页一键挂爪/拆爪与五类传感器表单式增删（自动改 YAML 重载）+ 码垛分区场景模板 pallet（UR5e+2FG7，A 区取料→B 区码放，IK 验证全部取放点可达）+ GUI"新建场景"对话框 + UR10e 入库
+- [x] M7 URDF/SolidWorks 导入 + AI 场景生成 —— `robots[].model` 直读 URDF（mesh 路径重写 / package:// 剥除 / 逐关节补 motor，SolidWorks sw2urdf 导出即用）+ GUI 导入模型入口（贴地出生自动计算）+ AI 场景生成 Agent（自然语言 → 世界 YAML，本地双重校验失败回喂重试，`zoo://key` 模型引用）+ GUI 分栏自由拖动（面板滚动条化，视口可放大）
 
 ## 已知取舍（M0）
 

@@ -12,7 +12,12 @@ from agentsim.agent.bridge import (local_tools_manifest, to_openai_tools,
                                     system_prompt)
 from agentsim.agent.local_tools import LocalFiles, dispatch_local
 from agentsim.agent.worker import AgentWorker
+from agentsim.agent.scene_agent import (SceneGenError, extract_yaml,
+                                        generate_scene, resolve_zoo_models,
+                                        scene_system_prompt)
 
 __all__ = ["AgentConfig", "load_config", "save_config",
            "local_tools_manifest", "to_openai_tools", "system_prompt",
-           "LocalFiles", "dispatch_local", "AgentWorker"]
+           "LocalFiles", "dispatch_local", "AgentWorker",
+           "SceneGenError", "extract_yaml", "generate_scene",
+           "resolve_zoo_models", "scene_system_prompt"]
