@@ -7,11 +7,17 @@ attachment_site），其关节/执行器/tendon 经嵌套 attach 后全名变为
 robot.set("gripper/gripper_act", v) 开合。
 
 mount 标定（见 models/grippers/onrobot_2fg7.xml 顶部注释）：
-夹爪 root 在自包含 XML 中归零，相对挂点 site 的安装变换（法兰盘厚度 +
-轴向翻转）全部记录在下表 mounts 里。四台 menagerie 机械臂（ur5e/ur10e/
-xarm7_nohand/panda_nohand）的 attachment_site 局部轴约定一致，实测同一
-套 (pos=[0,-0.028,0.1494], quat=[0,1,0,0]) 即可让夹爪 TCP 落在挂点
-+z 0.1494m、夹爪正向与官方 ur10e+2FG7 参考场景逐位吻合。
+夹爪 root 在自包含 XML 中归零，相对挂点 site 的安装变换（贴合量 +
+轴向翻转）全部记录在下表 mounts 里。关键事实：base STL 经 mesh 内置
+旋转后，其后法兰对接面在 gripper_base body 系 +y=0.1094 处、手指沿
+body -y 伸出（开合沿 ±x）；四台 menagerie 机械臂挂点的工具轴均为
+site +z（UR 的 site y 沿腕部壳体、非法兰法向）。故安装朝向统一用
+Rot_x(-90°)（wxyz=[0.7071,-0.7071,0,0]）：手指转向 site +z（法兰
+法向）、base 后端面转向 site -z 贴合机器人法兰；x=y=0 保证两法兰
+同轴。z 分量逐臂按"法兰面在 site 系的 z + 0.1094"几何标定
+（ur5e/xarm7/panda 法兰面≈0，ur10e=0.017），不可共用一值。旧值
+误写 Rot_x(180°) 且 z=0.1494、y=-0.028，夹爪被转到 site ±y 方向
+垂在腕部壳体下方、并与法兰留有约 9cm 间隙。
 """
 from __future__ import annotations
 
@@ -26,9 +32,16 @@ GRIPPER_DIR = ROOT / "models" / "grippers"
 # "gripper/" 开头，避免与机器人本体同名设备冲突
 GRIPPER_PREFIX = "gripper/"
 
-#: 2FG7 统一安装变换（site 局部系；四臂通用，实测值，见模块 docstring）
-_MOUNT_2FG7 = {"pos": [0.0, -0.028, 0.1494],
-               "quat": [0.0, 1.0, 0.0, 0.0]}     # Rot_x(180°)，wxyz
+#: 2FG7 安装朝向（site 局部系，wxyz）：Rot_x(-90°)，把沿 body -y 伸出的
+#: 手指转到 site +z（法兰法向），四臂挂点轴约定一致，共用此朝向
+_QUAT_2FG7 = [0.7071067811865476, -0.7071067811865475, 0.0, 0.0]
+
+#: 2FG7 逐臂安装位姿（site 局部系；pos 的 z = 该臂法兰面 z + base 后端面
+#: 0.1094，几何标定，见模块 docstring；x=y=0 保持两法兰同轴）
+_MOUNT_UR5E = {"pos": [0.0, 0.0, 0.1094], "quat": _QUAT_2FG7}
+_MOUNT_UR10E = {"pos": [0.0, 0.0, 0.1264], "quat": _QUAT_2FG7}
+_MOUNT_XARM7 = {"pos": [0.0, 0.0, 0.1094], "quat": _QUAT_2FG7}
+_MOUNT_PANDA = {"pos": [0.0, 0.0, 0.1092], "quat": _QUAT_2FG7}
 
 GRIPPERS: dict[str, dict] = {
     "onrobot_2fg7": {
@@ -42,10 +55,10 @@ GRIPPERS: dict[str, dict] = {
         "joints": ("left_slide", "right_slide"),
         # key = 机器人模型文件 basename；未列出的机器人报清晰错误而非静默错挂
         "mounts": {
-            "ur5e.xml": _MOUNT_2FG7,
-            "ur10e.xml": _MOUNT_2FG7,
-            "xarm7_nohand.xml": _MOUNT_2FG7,
-            "panda_nohand.xml": _MOUNT_2FG7,
+            "ur5e.xml": _MOUNT_UR5E,
+            "ur10e.xml": _MOUNT_UR10E,
+            "xarm7_nohand.xml": _MOUNT_XARM7,
+            "panda_nohand.xml": _MOUNT_PANDA,
         },
     },
 }

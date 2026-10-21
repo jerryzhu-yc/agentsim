@@ -33,7 +33,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 - **MCP 原生接入**：零依赖自实现的 stdio JSON-RPC MCP 服务器，任何支持 MCP 的 AI Agent（Claude、Trae 等）都能直接驱动仿真，包括让 Agent 用 `screenshot` 截取仿真画面"亲眼"看世界
 - **传感器系统**：YAML 里给机器人声明 encoder / IMU / 触觉 / 关节力矩 / 相机五类传感器，编译进 MuJoCo 模型、读数进观测流，GUI 面板实时显示；传感器是只读派生量，不改变物理轨迹（bit 级守护测试保证）
 - **机器人模型库**：MuJoCo Menagerie 官方模型一键接入——预配置 14 个著名机器人（Unitree Go1/Go2/H1/G1、ANYmal C、Spot、Franka Panda、UR5e/UR10e、xArm7、Shadow Hand、ALOHA 等），GUI 点"模型库"选模型即生成世界 + 控制器模板并自动打开编辑器，改完控制律点 Run 即跑；AI Agent 走同一条 `zoo_create` 工具
-- **夹爪装配工作台**：内置 OnRobot 2FG7 平行夹爪，GUI"装备"页点选即可给 UR5e / UR10e / xArm7 / Panda 四臂挂爪/拆爪，并可视化挂点、关节、body 清单；同一页表单式添加五类传感器（encoder/IMU/触觉/关节力矩/相机），全部改 YAML 自动重载，不手写配置。夹爪安装位姿（mount）对四臂统一标定，与官方参考场景逐位吻合；自带"码垛分区"场景模板（UR5e+2FG7，A 区取料→B 区码放）
+- **夹爪装配工作台**：内置 OnRobot 2FG7 平行夹爪，GUI"装备"页点选即可给 UR5e / UR10e / xArm7 / Panda 四臂挂爪/拆爪，并可视化挂点、关节、body 清单；同一页表单式添加五类传感器（encoder/IMU/触觉/关节力矩/相机），全部改 YAML 自动重载，不手写配置。夹爪安装位姿（mount）按各臂腕部几何逐臂标定，夹爪后法兰与机器人法兰同轴贴合、指尖沿法兰法向伸出；自带"码垛分区"场景模板（UR5e+2FG7，A 区取料→B 区码放）
 - **RL 训练接口**：一个 YAML 世界 = 一个确定性 gymnasium.Env——动作空间 = 执行器拼接、观测 = qpos/qvel/传感器、reset 逐位一致（同 YAML 跑两遍轨迹逐 bit 相同，eval 可复现），单进程直驱不起 ZMQ，训练吞吐优先
 - **Supervisor 能力**：save/load 内存快照（物理状态逐位恢复）、teleport、reset——快照包含 `mjSTATE_FULLPHYSICS | mjSTATE_WARMSTART`，保证轨迹级可复现
 - **场景生成器**：6 个确定性模板（tabletop / push / maze / race / pallet / empty），同一命令 + 同一参数 = 逐字节相同的输出
@@ -106,6 +106,18 @@ start.bat                      # 双击即启动 GUI（快捷方式即指向它�
 ```powershell
 pip install stable-baselines3   # RL 训练示例（examples/train_ppo_go2.py）
 ```
+
+### Linux 部署
+
+按上面"安装"章节建好环境后，仓库根自带 `start.sh` 启动脚本：自动按 `.venv` → `venv` → PATH 里的 `python3` 顺序定位解释器，所有 CLI 子命令原样透传，无需手动激活 venv：
+
+```bash
+./start.sh gui                            # 桌面工作台
+./start.sh run worlds/pick_cube.yaml      # 跑一个内置任务（加 --json 出机器可读结果）
+./start.sh mcp                            # MCP 服务器（stdio，供 AI Agent 接入）
+```
+
+首次使用若提示无执行权限：`chmod +x start.sh`。渲染后端 Linux 默认 EGL（无显示器的服务器设 `MUJOCO_GL=osmesa` 或 `egl` 做无头渲染）。
 
 ## 快速开始
 
@@ -516,7 +528,7 @@ agentsim/
 - [x] M1 心跳机制 —— 控制器 `_recv` 100ms poller 轮询 + `getppid` 孤儿检测：内核进程一死控制器必被 init/subreaper 收养（父 pid 变化），随即 `RuntimeError("内核已退出")` 退出；思考时间无限等待语义不变
 - [x] M4 机器人模型库 —— MuJoCo Menagerie 官方模型一键接入（14 个预配置著名机器人，M6 新增 UR10e），`zoo_create` 生成世界 + 控制器模板，GUI 点击-打开-编程闭环
 - [x] M5 运动演示与智能工作台 —— 14 个模型一键运动演示（四足 trot / 机械臂扫掠 / 人形摆臂）+ GUI 位姿编辑面板（xyz+欧拉角）+ 内置 Python 代码编辑器（保存并运行）+ Agent 控制台（OpenAI 兼容 chat API 调用，AI 直接生成场景/写代码/运行验证）+ PPO 训练示例（`examples/train_ppo_go2.py`）
-- [x] M6 夹具/传感器装配工作台 —— OnRobot 2FG7 夹爪入库（site-attach 到 UR5e/UR10e/xArm7/Panda，mount 对四臂统一标定并与官方参考场景逐位吻合）+ GUI"装备"页一键挂爪/拆爪与五类传感器表单式增删（自动改 YAML 重载）+ 码垛分区场景模板 pallet（UR5e+2FG7，A 区取料→B 区码放，IK 验证全部取放点可达）+ GUI"新建场景"对话框 + UR10e 入库
+- [x] M6 夹具/传感器装配工作台 —— OnRobot 2FG7 夹爪入库（site-attach 到 UR5e/UR10e/xArm7/Panda，mount 按四臂腕部几何逐臂标定，夹爪与法兰同轴贴合）+ GUI"装备"页一键挂爪/拆爪与五类传感器表单式增删（自动改 YAML 重载）+ 码垛分区场景模板 pallet（UR5e+2FG7，A 区取料→B 区码放，IK 验证全部取放点可达）+ GUI"新建场景"对话框 + UR10e 入库
 - [x] M7 URDF/SolidWorks 导入 + AI 场景生成 —— `robots[].model` 直读 URDF（mesh 路径重写 / package:// 剥除 / 逐关节补 motor，SolidWorks sw2urdf 导出即用）+ GUI 导入模型入口（贴地出生自动计算）+ AI 场景生成 Agent（自然语言 → 世界 YAML，本地双重校验失败回喂重试，`zoo://key` 模型引用）+ GUI 分栏自由拖动（面板滚动条化，视口可放大）
 
 ## 已知取舍（M0）

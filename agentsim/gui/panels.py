@@ -17,10 +17,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPixmap,
                            QShortcut, QSyntaxHighlighter, QTextCharFormat,
                            QTextCursor)
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QMenu, QPlainTextEdit, QPushButton,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QMenu, QPlainTextEdit, QPushButton,
                                QStackedWidget, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -337,8 +337,36 @@ class PropertiesPanel(QWidget):
 
     # ------------------------------------------------------------ 任务数据
 
+    def update_live_pose(self, kind: str, name: str, pos, quat) -> None:
+        """运行中快照回写选中机器人/物体的实时位姿到 spin（不重建行）。
+
+        只在当前选中节点匹配时更新；用户正在编辑（spin 有焦点）时不打扰。
+        """
+        if self._pose_kind != kind or self._pose_name != name:
+            return
+        w = QApplication.focusWidget()
+        if isinstance(w, QDoubleSpinBox):
+            return
+        self._fill_pose(pos, quat)
+
     def update_obs(self, obs: dict) -> None:
         task = obs.get("task") or {}
+        # 选中机器人/物体的实时位姿（机器人运动时右侧坐标同步跳数）
+        if self._pose_kind and self._pose_name:
+            if self._pose_kind == "robot":
+                robs = (obs.get("robots") or {}).get(self._pose_name) or {}
+                root = robs.get("root")
+                if root is not None:
+                    self.update_live_pose("robot", self._pose_name,
+                                          root[0:3], root[3:7])
+            else:
+                oinfo = (obs.get("objects") or {}).get(self._pose_name)
+                if oinfo is not None:
+                    p = oinfo.get("pos")
+                    if p is not None:
+                        self.update_live_pose(
+                            "object", self._pose_name, p,
+                            oinfo.get("quat") or (1, 0, 0, 0))
         self._tick.setText(str(obs.get("tick", "-")))
         self._time.setText(str(obs.get("time", "-")))
         succ = task.get("success")

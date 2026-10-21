@@ -106,6 +106,8 @@ class RenderModel:
 
         # 选中高亮：body id 集合（render_frame 时向强调色着色）
         self.highlight_bodies: set[int] = set()
+        # 选中目标 (kind, name)：XYZ 移动轴锚点用（与高亮集合同步设置）
+        self.highlight_target: tuple[str, str] = ("", "")
         # 拖动预览：begin_move 记录初值，apply_move 施加 delta
         self._move_orig: list[tuple] = []
 
@@ -185,18 +187,105 @@ class RenderModel:
 
     def ray_to_zplane(self, relx: float, rely: float, z0: float):
         """屏幕点 (relx, rely) 的射线与高度 z=z0 水平面求交，无交点返回 None。"""
-        cam_pos, fwd, right, up = self._cam_basis()
-        tan_half = math.tan(math.radians(_FOV_Y_DEG / 2))
-        aspect = self._width / max(self._height, 1)
-        d = (fwd
-             + right * (2.0 * relx - 1.0) * tan_half * aspect
-             + up * (1.0 - 2.0 * rely) * tan_half)
+        cam_pos, d = self.ray_dir(relx, rely, normalize=False)
         if d[2] >= -1e-9:                      # 朝上/平行：永远到不了 z0 之下
             return None
         t = (z0 - cam_pos[2]) / d[2]
         if t <= 0:
             return None
         return cam_pos + t * d
+
+    def ray_dir(self, relx: float, rely: float, normalize: bool = True):
+        """屏幕点 -> (射线起点 cam_pos, 射线方向)。相机基见模块 docstring。"""
+        cam_pos, fwd, right, up = self._cam_basis()
+        tan_half = math.tan(math.radians(_FOV_Y_DEG / 2))
+        aspect = self._width / max(self._height, 1)
+        d = (fwd
+             + right * (2.0 * relx - 1.0) * tan_half * aspect
+             + up * (1.0 - 2.0 * rely) * tan_half)
+        if normalize:
+            d = d / np.linalg.norm(d)
+        return np.array(cam_pos, dtype=float), d
+
+    # ------------------------------------------------------------ XYZ 移动轴
+
+    def gizmo_axes(self):
+        """当前选中目标的移动轴几何；无选中返回 None。
+
+        返回 (kind, name, anchor_world, length)；锚点为 root body 世界坐标。
+        """
+        if not self.highlight_target:
+            return None
+        kind, name = self.highlight_target
+        a = self.node_world_pos(kind, name)
+        if a is None:
+            return None
+        length = max(0.08, self.cam.distance * 0.16)
+        return kind, name, np.asarray(a, dtype=float), length
+
+    def world_to_screen(self, p):
+        """世界点 -> (relx, rely)；在相机后方返回 None（0=顶/左，同渲染帧）。"""
+        cam_pos, fwd, right, up = self._cam_basis()
+        v = np.asarray(p, dtype=float) - cam_pos
+        vf = float(np.dot(v, fwd))
+        if vf <= 1e-6:
+            return None
+        tan_half = math.tan(math.radians(_FOV_Y_DEG / 2))
+        aspect = self._width / max(self._height, 1)
+        relx = 0.5 + float(np.dot(v, right)) / (vf * tan_half * aspect) * 0.5
+        rely = 0.5 - float(np.dot(v, up)) / (vf * tan_half) * 0.5
+        return relx, rely
+
+    def gizmo_hit(self, px: float, py: float, tol_px: float = 11.0):
+        """像素坐标拾取移动轴：返回轴索引 0=X/1=Y/2=Z，未命中 None。
+
+        屏幕点到轴投影线段的像素距离小于 tol_px 即命中（含轴端点外
+        一小段余量，方便点中箭头）。
+        """
+        g = self.gizmo_axes()
+        if g is None:
+            return None
+        _, _, anchor, length = g
+        hit, best = None, tol_px
+        for axis in range(3):
+            e = np.zeros(3); e[axis] = 1.0
+            sa = self.world_to_screen(anchor)
+            sb = self.world_to_screen(anchor + e * length * 1.12)
+            if sa is None or sb is None:
+                continue
+            ax0, ay0 = sa[0] * self._width, sa[1] * self._height
+            ax1, ay1 = sb[0] * self._width, sb[1] * self._height
+            vx, vy = ax1 - ax0, ay1 - ay0
+            ln2 = vx * vx + vy * vy
+            if ln2 < 1e-9:
+                continue
+            t = max(0.0, min(1.0,
+                             ((px - ax0) * vx + (py - ay0) * vy) / ln2))
+            cx, cy = ax0 + t * vx, ay0 + t * vy
+            dist = math.hypot(px - cx, py - cy)
+            if dist < best:
+                best, hit = dist, axis
+        return hit
+
+    def ray_axis_param(self, relx: float, rely: float,
+                       anchor, axis: int):
+        """屏幕点射线与"过 anchor 沿世界轴的无限直线"的最近点参数 s。
+
+        最近点 = anchor + s*e_axis；拖动时 s 的变化量即沿轴位移（米）。
+        射线与轴平行（退化）返回 None。
+        """
+        o, d = self.ray_dir(relx, rely, normalize=True)
+        e = np.zeros(3); e[axis] = 1.0
+        a = np.asarray(anchor, dtype=float)
+        b = float(np.dot(d, e))
+        denom = 1.0 - b * b
+        if denom < 1e-9:
+            return None
+        w0 = o - a
+        # 射线 o+t d 与轴 a+s e 最近点：对 (t,s) 求导解 2x2 得
+        # s = (e·w0 - (d·e)(d·w0)) / (1 - (d·e)^2)
+        s = (float(np.dot(e, w0)) - b * float(np.dot(d, w0))) / denom
+        return float(s)
 
     # ------------------------------------------------------------ 拾取/选中
 
@@ -230,7 +319,7 @@ class RenderModel:
         return None, None
 
     def set_selection(self, kind: str, name: str) -> None:
-        """设置选中高亮（scene 树联动，只改集合不渲染）。"""
+        """设置选中高亮（scene 树联动，1.设置高亮集合 2.记录移动轴目标）。"""
         hl: set[int] = set()
         if kind == "object":
             bid = self.index.objects.get(name)
@@ -239,6 +328,7 @@ class RenderModel:
         elif kind == "robot":
             hl.update(self.robot_roots.get(name, []))
         self.highlight_bodies = hl
+        self.highlight_target = (kind, name)
 
     # ------------------------------------------------------------ 拖动预览
 
@@ -277,11 +367,17 @@ class RenderModel:
 
     def node_world_pos(self, kind: str, name: str):
         """对象/机器人 root body 的当前世界坐标（HUD 三维坐标显示用；
-        拖动预览会实时改 qpos/body_pos -> mj_forward 后这里读到实时值）。"""
+        拖动预览会实时改 qpos/body_pos -> mj_forward 后这里读到实时值）。
+
+        world/sensor 等节点没有世界坐标，返回 None（否则 'world' 会按
+        名字误命中同名机器人，HUD/gizmo 拿到错误锚点）。
+        """
         if kind == "object":
             bid = self.index.objects.get(name)
             return (tuple(self.data.xpos[int(bid)])
                     if bid is not None else None)
+        if kind != "robot":
+            return None
         roots = self.robot_roots.get(name) or []
         if not roots:
             return None
@@ -376,6 +472,9 @@ class RenderView(QWidget):
         self.edit_allowed = False
         # 选中保持：重建模型（load_world 后）时恢复高亮
         self._selection = ("", "")
+        # XYZ 移动轴：悬停轴 / 拖动状态（axis, kind, name, s0, moved）
+        self._gizmo_hover = None
+        self._gizmo_axis = None
 
     # ------------------------------------------------------------ 模型接入
 
@@ -460,6 +559,7 @@ class RenderView(QWidget):
         if self._frame is not None:
             p.drawImage(self.rect(), self._frame)
             self._draw_hud(p)
+            self._draw_gizmo(p)
         else:
             p.setPen(QPen(QColor(theme.C_TEXT_DIM)))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
@@ -501,10 +601,11 @@ class RenderView(QWidget):
 
         # 选中对象的三维坐标（拖动中实时变化——用户拖动定位的直接参照）
         if self.rm is not None and self._selection[0]:
-            p = self.rm.node_world_pos(*self._selection)
-            if p is not None:
+            wpos = self.rm.node_world_pos(*self._selection)
+            if wpos is not None:
                 chip(10, y, [f"选中 {self._selection[1]}  "
-                             f"pos=({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f})"],
+                             f"pos=({wpos[0]:+.3f}, {wpos[1]:+.3f}, "
+                             f"{wpos[2]:+.3f})"],
                      accent=theme.C_OK)
 
         # 左下：相机参数 + FPS
@@ -516,8 +617,8 @@ class RenderView(QWidget):
                   f"渲染 {self._fps_ema:5.1f} FPS"])
 
         # 右下：鼠标操作提示
-        help_lines = ["左键 选中/拖动   Ctrl+左键 调高度(Z)   F 聚焦选中",
-                      "中键 俯仰   右键 平移   滚轮 缩放   模型库可拖入"]
+        help_lines = ["左键 选中/拖动   拖 XYZ 轴单轴移动   Ctrl+左键 调高度(Z)",
+                      "中键 俯仰   右键 平移   滚轮 缩放   F 聚焦   模型库可拖入"]
         w = max(fm.horizontalAdvance(t) for t in help_lines) + 12
         x = self.width() - w - 10
         y = self.height() - 12 - fm.height() * 2 - 8
@@ -527,6 +628,53 @@ class RenderView(QWidget):
             p.drawText(x + 6, y + 6 + fm.ascent() + i * fm.height(), t)
 
     # ------------------------------------------------------------ 鼠标交互
+
+    _AXIS_COLORS = ("#EF4444", "#22C55E", "#3B82F6")   # X 红 Y 绿 Z 蓝
+    _AXIS_LABELS = ("X", "Y", "Z")
+
+    def _draw_gizmo(self, p: QPainter) -> None:
+        """选中机器人/物体时叠加三维 XYZ 移动轴（Blender 风格）。"""
+        if (self.rm is None or not self._selection[0]
+                or not self.edit_allowed):
+            return
+        g = self.rm.gizmo_axes()
+        if g is None:
+            return
+        kind, name, anchor, length = g
+        sa = self.rm.world_to_screen(anchor)
+        if sa is None:
+            return
+        active = getattr(self, "_gizmo_axis", None)
+        hover = getattr(self, "_gizmo_hover", None)
+        font = QFont(); font.setBold(True); font.setPointSize(9)
+        p.setFont(font)
+        for axis in range(3):
+            e = np.zeros(3); e[axis] = 1.0
+            sb = self.rm.world_to_screen(anchor + e * length)
+            if sb is None:
+                continue
+            x0, y0 = sa[0] * self.width(), sa[1] * self.height()
+            x1, y1 = sb[0] * self.width(), sb[1] * self.height()
+            col = QColor(self._AXIS_COLORS[axis])
+            if active == axis:
+                col = QColor("#FBBF24")          # 拖动中：琥珀色
+            elif hover == axis:
+                col = col.lighter(150)
+            pen = QPen(col, 3.5 if active == axis else 2.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(int(x0), int(y0), int(x1), int(y1))
+            # 箭头：端点两侧短线
+            ang = math.atan2(y1 - y0, x1 - x0)
+            ah = 9.0
+            for da in (math.radians(28), -math.radians(28)):
+                p.drawLine(int(x1), int(y1),
+                           int(x1 - ah * math.cos(ang - da)),
+                           int(y1 - ah * math.sin(ang - da)))
+            # 轴标签（端点外 12px）
+            lx = x1 + 13 * math.cos(ang)
+            ly = y1 + 13 * math.sin(ang) + 4
+            p.drawText(int(lx), int(ly), self._AXIS_LABELS[axis])
 
     def _relxy(self, e):
         pos = e.position()
@@ -554,8 +702,25 @@ class RenderView(QWidget):
         if self._is_pan(e):
             self._drag = ("pan", e.position().x(), e.position().y())
             return
-        # 左键：先拾取——点中可拖对象则选中（编辑态进入拖动），否则旋转相机
+        # 左键：编辑态优先拾取 XYZ 移动轴（命中则沿单轴拖动），否则再选物体
         relx, rely = self._relxy(e)
+        if self.edit_allowed and self._selection[0]:
+            axis = self.rm.gizmo_hit(e.position().x(), e.position().y())
+            if axis is not None:
+                g = self.rm.gizmo_axes()
+                kind, name = self._selection
+                bids = ([self.rm.index.objects[name]] if kind == "object"
+                        else self.rm.robot_roots.get(name, []))
+                if bids:
+                    self.rm.begin_move(bids)
+                    s0 = self.rm.ray_axis_param(relx, rely, g[2], axis)
+                    if s0 is not None:
+                        self._gizmo_axis = axis
+                        self._drag = ("gizmo", axis, kind, name,
+                                      np.array(g[2]), s0, False)
+                        self.refresh()
+                        return
+        # 左键：先拾取——点中可拖对象则选中（编辑态进入拖动），否则旋转相机
         bid, selpnt = self.rm.pick(relx, rely)
         kind, name = self.rm.resolve_body(bid) if bid > 0 else (None, None)
         if kind is not None:
@@ -579,6 +744,7 @@ class RenderView(QWidget):
 
     def mouseMoveEvent(self, e) -> None:
         if self._drag is None or self.rm is None:
+            self._update_gizmo_hover(e)
             return
         mode = self._drag[0]
         if mode == "rotate":
@@ -591,6 +757,18 @@ class RenderView(QWidget):
             _, y0, el0 = self._drag
             dy = e.position().y() - y0
             self.rm.cam.elevation = max(-89.0, min(89.0, el0 + dy * 0.4))
+        elif mode == "gizmo":
+            # 沿单轴拖动：当前射线与轴直线最近点参数 - 起点参数 = 轴向位移
+            _, axis, kind, name, anchor0, s0, _moved = self._drag
+            relx, rely = self._relxy(e)
+            s = self.rm.ray_axis_param(relx, rely, anchor0, axis)
+            if s is not None:
+                ds = s - s0
+                delta = [0.0, 0.0, 0.0]
+                delta[axis] = ds
+                self.rm.apply_move(*delta)
+                self._drag = ("gizmo", axis, kind, name, anchor0, s0, True)
+                self.bodyMoved.emit(kind, name, *delta)
         elif mode == "body":
             _, kind, name, selpnt, dx, dy, _moved = self._drag
             relx, rely = self._relxy(e)
@@ -632,7 +810,35 @@ class RenderView(QWidget):
                 and self._drag[5]:
             _, kind, name, _y0, dz, _moved = self._drag
             self.bodyDropped.emit(kind, name, 0.0, 0.0, dz)
+        elif self._drag is not None and self._drag[0] == "gizmo" \
+                and self._drag[6]:
+            _, axis, kind, name, anchor0, s0, _moved = self._drag
+            relx = _e.position().x() / max(self.width(), 1)
+            rely = _e.position().y() / max(self.height(), 1)
+            s = self.rm.ray_axis_param(relx, rely, anchor0, axis)
+            ds = (s - s0) if s is not None else 0.0
+            delta = [0.0, 0.0, 0.0]
+            delta[axis] = ds
+            self.bodyDropped.emit(kind, name, *delta)
+        self._gizmo_axis = None
         self._drag = None
+        self.refresh()
+
+    def _update_gizmo_hover(self, e) -> None:
+        """无拖动时：鼠标悬停在轴上则高亮该轴并换光标。"""
+        if self.rm is None or not self.edit_allowed or not self._selection[0]:
+            if self._gizmo_hover is not None:
+                self._gizmo_hover = None
+                self.unsetCursor()
+                self.update()
+            return
+        axis = self.rm.gizmo_hit(e.position().x(), e.position().y())
+        if axis != self._gizmo_hover:
+            self._gizmo_hover = axis
+            self.setCursor(Qt.CursorShape.SizeAllCursor
+                           if axis is not None
+                           else Qt.CursorShape.ArrowCursor)
+            self.update()
 
     def wheelEvent(self, e) -> None:
         if self.rm is None:

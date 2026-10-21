@@ -3,8 +3,9 @@
 
   来源：OnRobot 官方 menagerie 资产（7 个 STL），改造点：
   - root body gripper_base 位姿归零（去掉官方 scene 里的 pos/euler）——夹爪
-    相对机械臂 attachment_site 的全部安装变换（法兰盘厚度 0.1214m + Rx(-90°)
-    等）收敛到 agentsim/grippers.py 的 mount 表，每臂一份、纯数据可调
+    相对机械臂 attachment_site 的全部安装变换收敛到 agentsim/grippers.py 的
+    mount 表，每臂一份、纯数据可调。朝向 Rot_x(-90°)（手指由 body -y 转到
+    site +z 法兰法向），pos.z 按各臂法兰面位置 + base 后端面 0.1094 标定
   - meshdir="assets" 相对本文件；attach 前由 builder 把 mesh 路径绝对化
     （合并 spec 编译时相对路径会失效，与 zoo._write_demo_model 同款处理）
 
@@ -55,8 +56,10 @@
               material="silicone_pad" contype="0" conaffinity="0"/>
         <geom type="mesh" mesh="left_finger_pad_coll"
               rgba="1 1 1 0" friction="1.0 0.02 0.002"/>
-        <!-- 触觉挂点：覆盖左指板内侧面（center 在 pad 中心附近） -->
-        <site name="left_pad_site" pos="0 0 -0.055" size="0.02 0.005 0.03"
+        <!-- 触觉挂点：覆盖左指板内侧面。注意 finger STL 经 mesh refquat 居中
+             后，指板几何在 finger body 系 -y 方向（非 STL 原始的 -z），pad
+             中心约 (-0.029,-0.028,0)，site 必须跟随该内置旋转 -->
+        <site name="left_pad_site" pos="-0.029 -0.028 0" size="0.01"
               rgba="1 0 0 0.25"/>
       </body>
 
@@ -70,7 +73,8 @@
               material="silicone_pad" contype="0" conaffinity="0"/>
         <geom type="mesh" mesh="right_finger_pad_coll"
               rgba="1 1 1 0" friction="1.0 0.02 0.002"/>
-        <site name="right_pad_site" pos="0 0 -0.055" size="0.02 0.005 0.03"
+        <!-- 触觉挂点：右指板内侧（与左指对称 +x），同样跟随 mesh refquat -->
+        <site name="right_pad_site" pos="0.029 -0.028 0" size="0.01"
               rgba="1 0 0 0.25"/>
       </body>
     </body>

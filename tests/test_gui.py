@@ -11,6 +11,7 @@ import pathlib
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+import numpy as np  # noqa: E402
 
 from agentsim.gui.mcp_client import (LineCodec, PendingMap,  # noqa: E402
                                       tool_response)
@@ -176,6 +177,93 @@ class TestRenderModel:
             assert float(rm.data.qpos[qadr + 2]) == pytest.approx(zq0 + 0.2)
             p = rm.node_world_pos("object", "cube")
             assert p is not None and p[2] > zq0 + 0.1
+        finally:
+            rm.close()
+
+    def test_gizmo_axes_selection(self):
+        """XYZ 移动轴：无选中返回 None；选中后锚点=root 世界坐标、长度为正。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            assert rm.gizmo_axes() is None              # 默认 highlight_target 空
+            rm.set_selection("robot", "arm")
+            g = rm.gizmo_axes()
+            assert g is not None
+            kind, name, anchor, length = g
+            assert (kind, name) == ("robot", "arm")
+            assert list(anchor) == pytest.approx(
+                list(rm.node_world_pos("robot", "arm")))
+            assert length >= 0.08
+            rm.set_selection("object", "cube")
+            kind, name, anchor, _ = rm.gizmo_axes()
+            assert (kind, name) == ("object", "cube")
+            assert list(anchor) == pytest.approx(
+                list(rm.node_world_pos("object", "cube")))
+        finally:
+            rm.close()
+
+    def test_world_to_screen_roundtrip_and_behind(self):
+        """world_to_screen：屏幕点反投影射线必须经过原世界点；相机后方返 None。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, _ = rm.gizmo_axes()
+            for p in (anchor, anchor + [0.1, -0.05, 0.2],
+                      anchor + [-0.2, 0.08, 0.03]):
+                rel = rm.world_to_screen(p)
+                assert rel is not None
+                o, d = rm.ray_dir(rel[0], rel[1])
+                # 射线 o+t d 到 p 的最近距离应近似 0，且 p 在前方
+                t = float((p - o) @ d)
+                assert t > 0
+                closest = o + t * d
+                assert float(np.linalg.norm(closest - p)) < 1e-9
+            # 相机正后方一点 -> None
+            cam_pos, fwd, _, _ = rm._cam_basis()
+            assert rm.world_to_screen(cam_pos - fwd) is None
+        finally:
+            rm.close()
+
+    def test_gizmo_hit_three_axes(self):
+        """像素拾取：三轴各自的屏幕投影中点必须命中对应轴，偏离处不命中。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, length = rm.gizmo_axes()
+            for axis in range(3):
+                e = np.zeros(3); e[axis] = 1.0
+                rel = rm.world_to_screen(anchor + e * length * 0.5)
+                px, py = rel[0] * 64, rel[1] * 48
+                assert rm.gizmo_hit(px, py, tol_px=8) == axis
+            # 远离全部轴投影的角落像素：不命中（容许返回 None）
+            assert rm.gizmo_hit(0.5, 0.5, tol_px=1) in (None, 0, 1, 2)
+            # 无选中时永不命中
+            rm.highlight_target = ("", "")
+            assert rm.gizmo_hit(32.0, 24.0) is None
+        finally:
+            rm.close()
+
+    def test_ray_axis_param_roundtrip(self):
+        """拖动测距：轴线上世界点 anchor+s*e 投影回屏幕后，
+        ray_axis_param 必须还原 s（多个 s 单调一致）。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, _ = rm.gizmo_axes()
+            for axis in range(3):
+                prev = None
+                for s in (0.0, 0.04, 0.09, 0.15):
+                    e = np.zeros(3); e[axis] = 1.0
+                    rel = rm.world_to_screen(anchor + e * s)
+                    got = rm.ray_axis_param(rel[0], rel[1], anchor, axis)
+                    assert got is not None
+                    assert abs(got - s) < 1e-6, (axis, s, got)
+                    if prev is not None:
+                        assert got > prev
+                    prev = got
         finally:
             rm.close()
 
@@ -370,6 +458,102 @@ def test_properties_pose_panel(qapp):
         assert p._pose_name is None
     finally:
         p.deleteLater()
+
+
+def test_properties_live_pose_refresh(qapp):
+    """实时位姿：update_obs 把选中机器人 root/物体 pos 回写 spin；
+    不匹配的名字不刷新；spin 正在编辑（有焦点）时不被运行帧覆盖。"""
+    from PySide6.QtWidgets import QDoubleSpinBox
+
+    from agentsim.gui.panels import PropertiesPanel
+
+    class _R:
+        model = "m.xml"; controller = None; sensors = (); args = {}
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    class _O:
+        type = "box"; size = (0.05, 0.05, 0.05); static = False
+        mass = None; color = "#888"
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    p = PropertiesPanel()
+    p.show()                       # offscreen 下也需可见，setFocus 才生效
+    qapp.processEvents()
+    try:
+        # 机器人 root 七元组 [x y z qw qx qy qz]：运动帧进来坐标必须跳数
+        p.show_node("robot", "arm", _R([0.0, 0.0, 0.0], None))
+        p.update_obs({"tick": 1, "robots": {"arm": {
+            "root": [0.12, -0.34, 0.56, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.12, -0.34, 0.56])
+        # 别的机器人的帧不能覆盖当前选中
+        p.update_obs({"tick": 2, "robots": {"other": {
+            "root": [9.0, 9.0, 9.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.12, -0.34, 0.56])
+
+        # spin 获得焦点（用户正在输入）时跳过回写，不打扰编辑
+        spin = p._pos_spins[0]
+        spin.setFocus()
+        qapp.processEvents()
+        assert isinstance(qapp.focusWidget(), QDoubleSpinBox)
+        p.update_obs({"tick": 3, "robots": {"arm": {
+            "root": [0.78, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert spin.value() == pytest.approx(0.12)
+        spin.clearFocus()
+
+        # 物体路径：objects[].pos/quat 回写
+        p.show_node("object", "cube", _O([0.5, 0.3, 0.1], None))
+        p.update_obs({"tick": 4, "objects": {"cube": {
+            "pos": [0.61, 0.22, 0.33],
+            "quat": [0.7071068, 0.0, 0.0, 0.7071068]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.61, 0.22, 0.33])
+        assert p._rot_spins[2].value() == pytest.approx(90.0, abs=1e-2)
+
+        # 清空选择后运行帧不再触碰 spin
+        vals = [s.value() for s in p._pos_spins]
+        p.clear_selection()
+        p.update_obs({"tick": 5, "robots": {"arm": {
+            "root": [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == vals
+    finally:
+        p.deleteLater()
+
+
+def test_hud_paint_with_selection_survives(qapp):
+    """回归：加载世界后场景树自动选中"世界"节点，_draw_hud 曾把
+    QPainter 参数 p 覆盖成世界坐标 tuple——此后每帧 paint 抛
+    AttributeError、QPainter 不收尾损坏 backing store，最大化/缩放
+    窗口即段错误闪退（"最大化闪退 / 加载机器狗报错"两个症状同根因）。
+    """
+    from PySide6.QtGui import QPainter, QPixmap
+
+    from agentsim.gui.render_view import RenderView
+
+    spec = load_world(WORLD)
+    view = RenderView()
+    try:
+        view.resize(400, 300)
+        view.set_world(spec)
+        pm = QPixmap(400, 300)
+        pt = QPainter(pm)
+        # 世界根节点选中（场景树 set_world 后的自动状态）：
+        # world/sensor 没有世界坐标，不得误命中同名机器人
+        view._selection = ("world", spec.name)
+        view._draw_hud(pt)
+        assert view.rm.node_world_pos("world", spec.name) is None
+        # 机器人选中：HUD 选中坐标芯片 + gizmo 绘制正常路径
+        view._selection = ("robot", spec.robots[0].name)
+        view._draw_hud(pt)
+        view.edit_allowed = True
+        view._draw_gizmo(pt)
+        pt.end()
+    finally:
+        view.rm.close()
+        view.deleteLater()
 
 
 # ================================================================ M5-P3 代码编辑器
