@@ -7,12 +7,14 @@
 """
 import os
 import pathlib
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 import numpy as np  # noqa: E402
 
+from agentsim.gui import mount_ime_plugin  # noqa: E402
 from agentsim.gui.mcp_client import (LineCodec, PendingMap,  # noqa: E402
                                       tool_response)
 from agentsim.gui.render_view import RenderModel, _JNT_WIDTH  # noqa: E402
@@ -985,3 +987,76 @@ def test_scene_agent_dialog_save(qapp, monkeypatch, tmp_path):
         assert "已保存" in dlg.status.text()
     finally:
         dlg.deleteLater()
+
+
+# ---------------------------------------------------------------- IME 挂载
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fcitx 插件仅 Linux")
+class TestMountImePlugin:
+    """mount_ime_plugin：本地 fcitx5 插件目录存在时自动挂载。"""
+
+    def _mk_plugin(self, home):
+        d = (home / ".local/share/agentsim/qt-plugins"
+             / "platforminputcontexts")
+        d.mkdir(parents=True)
+        (d / "libfcitx5platforminputcontextplugin.so").touch()
+        return d
+
+    def test_mount_sets_plugin_path(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"] == \
+            str(tmp_path / ".local/share/agentsim/qt-plugins")
+        assert os.environ["QT_IM_MODULE"] == "fcitx"
+
+    def test_noop_without_plugin(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert "QT_PLUGIN_PATH" not in os.environ
+        assert "QT_IM_MODULE" not in os.environ
+
+    def test_prepend_preserves_existing_path(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setenv("QT_PLUGIN_PATH", "/some/other")
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"].split(os.pathsep) == [
+            str(tmp_path / ".local/share/agentsim/qt-plugins"), "/some/other"]
+
+    def test_respects_existing_im_module(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setenv("QT_IM_MODULE", "ibus")
+        mount_ime_plugin()
+        assert os.environ["QT_IM_MODULE"] == "ibus"   # 不覆盖用户配置
+
+    def test_headless_noop(self, monkeypatch, tmp_path):
+        """无 DISPLAY/WAYLAND_DISPLAY（无头/CI）：插件在也不挂。"""
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        mount_ime_plugin()
+        assert "QT_PLUGIN_PATH" not in os.environ
+
+    def test_noop_when_wayland_display(self, monkeypatch, tmp_path):
+        """Wayland 会话（WAYLAND_DISPLAY）也允许挂载。"""
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"].endswith(
+            ".local/share/agentsim/qt-plugins")

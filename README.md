@@ -119,6 +119,46 @@ pip install stable-baselines3   # RL 训练示例（examples/train_ppo_go2.py）
 
 首次使用若提示无执行权限：`chmod +x start.sh`。渲染后端 Linux 默认 EGL（无显示器的服务器设 `MUJOCO_GL=osmesa` 或 `egl` 做无头渲染）。
 
+### Linux 中文输入（fcitx5 GUI 集成）
+
+**现象**：fcitx5 桌面下 GUI 文本框（尤其 Agent 对话框）打不了中文（拼音候选词不弹出）。
+
+**原因**：pip 装的 PySide6 只自带 compose/ibus 输入法插件；系统 Qt 的 fcitx 插件又因 Qt 私有 ABI 必须与运行时 Qt 严格同版本而无法借用——需要针对 PySide6 捆绑的 Qt 版本单独编译一个 fcitx5 插件。
+
+**方案**：把编译好的插件装到约定目录 `~/.local/share/agentsim/qt-plugins/platforminputcontexts/`，GUI 启动时自动挂载（`agentsim/gui/__init__.py` 的 `mount_ime_plugin`，在 QApplication 之前生效）。构建全程免 root，一次约 3 分钟：
+
+```bash
+# 0) 依赖开发包免 root 解包到 /tmp/fcitxbuild/root
+mkdir -p /tmp/fcitxbuild/root && cd /tmp/fcitxbuild
+apt-get download extra-cmake-modules libfcitx5utils-dev libfcitx5utils2 \
+    libxkbcommon-dev libxkbcommon-x11-dev gettext
+for d in ./*.deb; do dpkg -x "$d" root/; done
+export PATH=/tmp/fcitxbuild/root/usr/bin:$PATH
+
+# 1) 与 PySide6 捆绑 Qt 完全同版本的开发包（aqt 官方在线安装器）
+python -m pip install -q aqtinstall
+QT_VER=$(python -c "import PySide6;print(PySide6.__version__)")   # 如 6.12.0
+python -m aqt install-qt linux desktop "$QT_VER" linux_gcc_64 -O /tmp/qt612
+
+# 2) 编译 fcitx5-qt 输入法插件（BUILD_ONLY_PLUGIN 只编译这一个插件）
+git clone --depth 1 https://github.com/fcitx/fcitx5-qt.git
+cd fcitx5-qt
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="/tmp/qt612/$QT_VER/gcc_64;/tmp/fcitxbuild/root/usr" \
+    -DBUILD_ONLY_PLUGIN=ON -DENABLE_QT4=OFF -DENABLE_QT5=OFF -DENABLE_QT6=ON \
+    -DENABLE_QT6_WAYLAND_WORKAROUND=OFF
+cmake --build build -j$(nproc)
+
+# 3) 去掉构建机 rpath、装进约定目录（GUI 启动自动挂载）
+python -m pip install -q patchelf
+patchelf --remove-rpath build/qt6/platforminputcontext/libfcitx5platforminputcontextplugin.so
+mkdir -p ~/.local/share/agentsim/qt-plugins/platforminputcontexts
+cp build/qt6/platforminputcontext/libfcitx5platforminputcontextplugin.so \
+   ~/.local/share/agentsim/qt-plugins/platforminputcontexts/
+```
+
+装好后重启 GUI 即可在 Agent 对话框用 fcitx5 打中文。注意：**升级 PySide6 后需按同版本号重跑第 1~3 步**（Qt 插件 ABI 必须与运行时 Qt 一致，版本不匹配会静默回退到英文输入）。
+
 ## 快速开始
 
 ### 1. 跑一个内置任务（人类用户）
@@ -536,7 +576,7 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 260 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 266 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop/save_world 往返）/
 #              传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
@@ -580,7 +620,7 @@ agentsim/
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
-└── tests/                 # 260 项测试（含 URDF 导入/AI 场景生成/夹爪/码垛）
+└── tests/                 # 266 项测试（含 URDF 导入/AI 场景生成/夹爪/码垛）
 ```
 
 ## Roadmap
