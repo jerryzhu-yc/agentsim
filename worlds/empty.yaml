@@ -1,0 +1,16 @@
+name: empty
+timestep: 0.002
+ctrl_period: 32
+gravity: [0, 0, -9.81]
+scene:
+  floor:
+    size: [5.0, 5.0]
+    texture: grid
+  lights:
+  - pos: [0.0, 0.0, 4.0]
+  - pos: [3.0, -3.0, 4.0]
+  - pos: [-3.0, 3.0, 4.0]
+  objects: []
+robots: []
+integrator: implicitfast
+impratio: 10

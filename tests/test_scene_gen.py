@@ -83,8 +83,9 @@ def test_pallet_smoke(tmp_path, name, params):
     assert stats["ticks"] == 100
     assert not stats["nan"]
     assert stats["crashed"] == []
-    # 产出是合法 YAML 且 model 是绝对路径（menagerie 缓存）
-    assert str(yaml.safe_load(text)["robots"][0]["model"]).startswith("/")
+    # 产出是合法 YAML 且 model 是 zoo:// 模型库引用（load 时解析成缓存路径）
+    assert str(yaml.safe_load(text)["robots"][0]["model"]) \
+        .startswith("zoo://")
 
 
 def test_deterministic(tmp_path):

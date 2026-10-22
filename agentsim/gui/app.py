@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import numpy as np
 import yaml
@@ -219,29 +220,32 @@ class NewSceneDialog(QDialog):
 
 
 class _SceneGenWorker(QThread):
-    """后台跑 generate_scene（HTTP + zoo 下载），不阻塞对话框 UI。"""
+    """后台跑 SceneGenSession 的 generate/refine（HTTP + zoo 下载），
+    不阻塞对话框 UI。一次性 worker：每次生成/微调新建一个，共享 dialog
+    持有的同一个 Session（messages 历史跨轮连续）。"""
 
     statusChanged = Signal(str)
     generated = Signal(str, str)            # (yaml_text, LLM 说明)
     failed = Signal(str)
 
-    def __init__(self, requirement: str, cfg, parent=None):
+    def __init__(self, session, op: str, req: str, parent=None):
         super().__init__(parent)
-        self._req = requirement
-        self._cfg = cfg
+        self._session = session
+        self._op = op                       # "generate" | "refine"
+        self._req = req
         self._stop = False
 
     def stop(self):
         self._stop = True                   # 只置位：HTTP 中途不可打断
 
     def run(self):
-        from agentsim.agent import generate_scene
         try:
-            def on_dl(key):
-                self.statusChanged.emit(f"首次使用 {key}，联网下载模型…")
-            self.statusChanged.emit("LLM 生成中…")
-            text, note = generate_scene(self._req, self._cfg,
-                                        on_download=on_dl)
+            self.statusChanged.emit(
+                "LLM 修改中…" if self._op == "refine" else "LLM 生成中…")
+            if self._op == "generate":
+                text, note = self._session.generate(self._req)
+            else:
+                text, note = self._session.refine(self._req)
             if self._stop:
                 return
             self.generated.emit(text, note)
@@ -251,22 +255,31 @@ class _SceneGenWorker(QThread):
 
 
 class SceneAgentDialog(QDialog):
-    """AI 场景生成：自然语言需求 -> 世界 YAML（生成-校验-重试闭环）。"""
+    """AI 场景生成：自然语言需求 -> 世界 YAML（生成-校验-重试闭环）。
 
-    generated = Signal(str)                # 生成成功（世界 YAML 文本）
+    生成成功不直接加载：先展示 YAML 预览，用户可 [加载并关闭]（发
+    generated 信号走主窗口加载）、[保存…] 落盘，或在输入框继续写修改
+    要求点 [应用修改]（SceneGenSession.refine 增量微调，可循环）。
+    """
+
+    generated = Signal(str)                # 用户确认加载（世界 YAML 文本）
+    statusChanged = Signal(str)            # 模型下载等异步提示（跨线程安全）
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.setWindowTitle("AI 生成场景")
-        self.resize(560, 420)
+        self.resize(640, 560)
         self._cfg = cfg
+        self._session = None               # 首次生成时构造（SceneGenSession）
         self._worker: _SceneGenWorker | None = None
+        self._yaml = ""                    # 当前预览的 YAML（refine 基准）
+        self.note = ""                     # 主窗口经 sender() 取走记控制台
 
         lay = QVBoxLayout(self)
         tip = QLabel("用一句话描述你想要的场景（机器人、物体、任务），"
-                     "AI 直接生成对应的世界 YAML 并本地校验，失败自动重试。\n"
+                     "AI 生成世界 YAML 并本地校验，失败自动重试。\n"
                      "例：一只 Go2 四足机器狗站在 3x3 米场地中央，"
-                     "面前 1 米处放一个红色方块。")
+                     "面前 1 米处放一个红色方块。生成后可保存或继续调整。")
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
@@ -279,41 +292,113 @@ class SceneAgentDialog(QDialog):
         self.status.setStyleSheet("color:#9CA3AF;")
         lay.addWidget(self.status)
 
+        lay.addWidget(QLabel("生成结果（YAML 预览）："))
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("尚未生成。")
+        lay.addWidget(self.preview, stretch=3)
+
+        self.note_label = QLabel()
+        self.note_label.setWordWrap(True)
+        self.note_label.setStyleSheet("color:#9CA3AF;")
+        lay.addWidget(self.note_label)
+
         row = QHBoxLayout()
-        btn_gen = QPushButton("生成")
-        btn_gen.setObjectName("primary")
-        btn_gen.setDefault(True)
-        btn_gen.clicked.connect(self._on_generate)
-        row.addWidget(btn_gen)
+        self.btn_gen = QPushButton("生成")
+        self.btn_gen.setObjectName("primary")
+        self.btn_gen.setDefault(True)
+        self.btn_gen.clicked.connect(self._on_generate)
+        row.addWidget(self.btn_gen)
+        self.btn_load = QPushButton("加载并关闭")
+        self.btn_load.setEnabled(False)
+        self.btn_load.clicked.connect(self._on_load)
+        row.addWidget(self.btn_load)
+        self.btn_save = QPushButton("保存…")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._on_save)
+        row.addWidget(self.btn_save)
         self.btn_close = QPushButton("关闭")
         self.btn_close.clicked.connect(self._on_close)
         row.addWidget(self.btn_close)
         row.addStretch(1)
         lay.addLayout(row)
 
+        self.statusChanged.connect(self.status.setText)
+
     def _on_generate(self):
+        """首次点击=生成；已有结果后点击=应用修改（refine）。防重入。"""
         text = self.input.toPlainText().strip()
+        if self._worker is not None and self._worker.isRunning():
+            return
         if not text:
             self.status.setText("先输入需求描述。")
             return
-        self.status.setText("LLM 生成中…")
+        if self._session is None:
+            # 惰性构造：monkeypatch agentsim.agent.SceneGenSession 可测
+            from agentsim.agent import SceneGenSession
+            self._session = SceneGenSession(
+                self._cfg,
+                on_download=lambda k: self.statusChanged.emit(
+                    f"首次使用 {k}，联网下载模型…"))
+        op = "refine" if self._yaml else "generate"
+        self.btn_gen.setEnabled(False)
         self.btn_close.setText("取消")
-        self._worker = _SceneGenWorker(text, self._cfg, self)
+        self._worker = _SceneGenWorker(self._session, op, text, self)
         self._worker.statusChanged.connect(self.status.setText)
         self._worker.generated.connect(self._on_generated)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
     def _on_generated(self, yaml_text: str, note: str):
-        self.status.setText("生成成功，正在加载世界…")
-        self.note = note.strip()            # app 侧取走记入控制台
-        self.generated.emit(yaml_text)
-        self.accept()
+        """生成/微调成功：刷新预览，切到可加载/保存/继续调整状态。"""
+        self._yaml = yaml_text
+        self.note = note.strip()
+        self.preview.setPlainText(yaml_text)
+        self.note_label.setText(f"AI 说明：{self.note}" if self.note else "")
+        self.status.setText("校验通过。可加载、保存，或继续输入修改要求。")
+        self.btn_gen.setEnabled(True)
+        self.btn_gen.setText("应用修改")
+        self.input.clear()
+        self.input.setPlaceholderText(
+            "继续调整：输入修改要求，如\"把方块改成蓝色，再加一个球\"…")
+        self.btn_load.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        self.btn_close.setText("关闭")
+        self._worker = None
 
     def _on_failed(self, err: str):
         self.status.setText(f"生成失败：{err}")
+        self.btn_gen.setEnabled(True)
         self.btn_close.setText("关闭")
         self._worker = None
+
+    def _on_load(self):
+        """确认加载：发 generated 信号（主窗口全量加载）并关闭。"""
+        if self._yaml:
+            self.generated.emit(self._yaml)
+            self.accept()
+
+    def _on_save(self):
+        """把当前 YAML 另存为文件（文件名建议取世界名，可改）。"""
+        if not self._yaml:
+            return
+        try:
+            name = (yaml.safe_load(self._yaml) or {}).get("name", "ai_scene")
+        except Exception:
+            name = "ai_scene"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存世界 YAML", f"ai_{name}.yaml", "YAML (*.yaml)")
+        if not path:
+            return
+        p = pathlib.Path(path)
+        if p.suffix.lower() not in (".yaml", ".yml"):
+            p = p.with_suffix(".yaml")
+        try:
+            p.write_text(self._yaml, encoding="utf-8")
+        except OSError as e:
+            self.status.setText(f"保存失败：{e}")
+            return
+        self.status.setText(f"已保存到 {p}")
 
     def _on_close(self):
         if self._worker is not None and self._worker.isRunning():
@@ -439,9 +524,16 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._poll)
         self.timer.start()
 
-        self._apply_state("就绪。文件 → 打开世界（worlds/ 下有示例），"
-                          "或从模型库新建。")
-        self.console.info("GUI 已启动，等待加载世界。")
+        # ---- 启动即加载纯空场景（只有地面的默认工作台）
+        empty_world = (pathlib.Path(__file__).resolve().parents[2]
+                       / "worlds" / "empty.yaml")
+        if empty_world.exists():
+            self._load_world_path(str(empty_world))
+            self._apply_state("正在加载默认空场景…")
+        else:
+            self._apply_state("就绪。文件 → 打开世界（worlds/ 下有示例），"
+                              "或从模型库新建。")
+            self.console.info("GUI 已启动，等待加载世界。")
 
     # ============================================================ 界面构建
 

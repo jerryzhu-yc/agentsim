@@ -629,7 +629,7 @@ def _gear_manifest():
         }],
         "gripper_catalog": [
             {"key": "onrobot_2fg7", "title": "OnRobot 2FG7 平行夹爪",
-             "cat": "parallel", "open": 0.0, "close": 0.038,
+             "cat": "parallel", "open": 0.038, "close": 0.0,
              "supported_robots": ["ur5e.xml"]}],
     }
 
@@ -842,9 +842,10 @@ def _wait_worker(qapp, dlg, timeout_s=5.0):
 
 
 def test_scene_agent_dialog_flow(qapp, monkeypatch):
-    """空输入提示；生成成功发 generated 信号并带 note。"""
+    """空输入提示；生成成功后预览/按钮状态；点加载发 generated 信号。"""
     from agentsim.agent import AgentConfig
     from agentsim.gui.app import SceneAgentDialog
+    from PySide6.QtWidgets import QDialog
     cfg = AgentConfig(base_url="http://x/v1", model="m")
     dlg = SceneAgentDialog(cfg)
     try:
@@ -852,25 +853,37 @@ def test_scene_agent_dialog_flow(qapp, monkeypatch):
         dlg._on_generate()
         assert dlg.status.text().startswith("先输入")
         assert dlg._worker is None
-        # 正常输入 + 打桩 generate_scene（含 zoo 下载回调）
+        # 正常输入 + 打桩 SceneGenSession（含 zoo 下载回调）
         dlg.input.setPlainText("一只机器狗")
         seen = []
 
-        def fake_gen(req, c, on_download=None):
-            seen.append((req, on_download is not None))
-            if on_download:
-                on_download("unitree_go2")
-            return ("name: ok\nfloor: {}\n", "已生成简单场景")
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                self.dl = on_download
+
+            def generate(self, req):
+                seen.append(("generate", req))
+                if self.dl:
+                    self.dl("unitree_go2")
+                return "name: ok\nfloor: {}\n", "已生成简单场景"
 
         import agentsim.agent as agent_pkg
-        monkeypatch.setattr(agent_pkg, "generate_scene", fake_gen)
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
         got = []
         dlg.generated.connect(got.append)
         dlg._on_generate()
         _wait_worker(qapp, dlg)
-        assert seen == [("一只机器狗", True)]
-        assert got == ["name: ok\nfloor: {}\n"]
+        assert seen == [("generate", "一只机器狗")]
+        # 预览刷新 + 按钮状态切换（生成成功不直接加载）
+        assert dlg.preview.toPlainText() == "name: ok\nfloor: {}\n"
+        assert dlg.btn_load.isEnabled() and dlg.btn_save.isEnabled()
+        assert dlg.btn_gen.text() == "应用修改"
         assert dlg.note == "已生成简单场景"
+        assert got == []                    # 未点加载，不发信号
+        # 点"加载并关闭"：发信号 + 关闭
+        dlg._on_load()
+        assert got == ["name: ok\nfloor: {}\n"]
+        assert dlg.result() == QDialog.DialogCode.Accepted
     finally:
         dlg.deleteLater()
 
@@ -878,21 +891,97 @@ def test_scene_agent_dialog_flow(qapp, monkeypatch):
 def test_scene_agent_dialog_failure(qapp, monkeypatch):
     """生成失败：状态栏显示错误，worker 复位可再试。"""
     from agentsim.agent import AgentConfig
-    from agentsim.gui.app import SceneAgentDialog
     from agentsim.agent.scene_agent import SceneGenError
+    from agentsim.gui.app import SceneAgentDialog
     cfg = AgentConfig(base_url="http://x/v1", model="m")
     dlg = SceneAgentDialog(cfg)
     try:
         dlg.input.setPlainText("需求")
+
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                raise SceneGenError("LLM 服务不可达")
+
         import agentsim.agent as agent_pkg
-        monkeypatch.setattr(
-            agent_pkg, "generate_scene",
-            lambda req, c, on_download=None: (_ for _ in ()).throw(
-                SceneGenError("LLM 服务不可达")))
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
         dlg._on_generate()
         _wait_worker(qapp, dlg)
         assert "生成失败" in dlg.status.text()
         assert "不可达" in dlg.status.text()
         assert dlg._worker is None
+        assert dlg.btn_gen.isEnabled()     # 可重试
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_refine(qapp, monkeypatch):
+    """生成后继续调整：第二次点按钮走 refine，预览刷新为新版。"""
+    from agentsim.agent import AgentConfig
+    from agentsim.gui.app import SceneAgentDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        seen = []
+
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                seen.append(("generate", req))
+                return "name: v1\n", "v1"
+
+            def refine(self, change):
+                seen.append(("refine", change))
+                return "name: v2\n", "v2"
+
+        import agentsim.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        dlg.input.setPlainText("放一个红方块")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert dlg.preview.toPlainText() == "name: v1\n"
+        # 继续调整：输入修改要求再点按钮（此时文本是"应用修改"）
+        dlg.input.setPlainText("把方块改成蓝色")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert seen == [("generate", "放一个红方块"),
+                        ("refine", "把方块改成蓝色")]
+        assert dlg.preview.toPlainText() == "name: v2\n"
+        assert dlg._yaml == "name: v2\n"
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_save(qapp, monkeypatch, tmp_path):
+    """保存按钮：QFileDialog 打桩选路径，YAML 落盘且状态提示。"""
+    from agentsim.agent import AgentConfig
+    from agentsim.gui.app import SceneAgentDialog
+    from PySide6.QtWidgets import QFileDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                return "name: my_world\nfloor: {}\n", ""
+
+        import agentsim.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        dlg.input.setPlainText("需求")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        out = tmp_path / "out.yaml"
+        monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                            lambda *a, **k: (str(out), "YAML (*.yaml)"))
+        dlg._on_save()
+        assert out.read_text(
+            encoding="utf-8") == "name: my_world\nfloor: {}\n"
+        assert "已保存" in dlg.status.text()
     finally:
         dlg.deleteLater()

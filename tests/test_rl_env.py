@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from agentsim.rl_env import AgentSimEnv
-from agentsim.world.schema import parse_world
+from agentsim.world.schema import parse_world, resolve_zoo_models
 import yaml
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -32,42 +32,43 @@ def _pick_spec(with_sensors: bool = False):
     """pick_cube 的 WorldSpec（controller 字段被 RL env 忽略——不起子进程）。"""
     text = WORLD.read_text(encoding="utf-8")
     if with_sensors:
-        anchor = "    controller: ../controllers/pick_place.py   # 侧扫推式相位机"
+        anchor = "    controller: ../controllers/pick_place.py"
         text = text.replace(anchor, anchor + "\n    sensors:\n"
-            + "      - {name: j1_enc, type: encoder, joint: j1}\n"
-            + "      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}")
-    spec = parse_world(yaml.safe_load(text))
+            + "      - {name: j1_enc, type: encoder, joint: joint1}\n"
+            + "      - {name: wrist_imu, type: imu, body: link7, pos: [0, 0, 0.02]}")
+    spec = parse_world(resolve_zoo_models(yaml.safe_load(text)))
     spec.base_dir = ROOT / "worlds"
     return spec
 
 
-def _reach_push_action(t: int) -> np.ndarray:
-    """T5 探针定值的两相位固定序列（reach 120 tick 摆位 -> a1 慢扫 0.55）。"""
-    if t < 120:
-        return np.array([0.0, 1.57, 0.0618, -0.03, 0.03], dtype=np.float32)
-    a1 = min(0.55, (t - 120 + 1) * 0.005)
-    return np.array([a1, 1.57, 0.0618, -0.03, 0.03], dtype=np.float32)
+def _probe_action(t: int) -> np.ndarray:
+    """固定探针序列：joint1 慢摆 + 腕转 + 夹爪半开（维度 = panda+夹爪 8）。"""
+    a = np.zeros(8, dtype=np.float32)
+    a[0] = min(1.0, t * 0.01)      # joint1 慢扫
+    a[6] = 0.5                     # joint7 腕转
+    a[7] = 0.02                    # gripper 半开
+    return a
 
 
 class TestSpaces:
     def test_action_space_matches_actuators(self):
         """动作空间 = 全执行器拼接，界 = ctrlrange（T1）。"""
         env = AgentSimEnv(WORLD)
-        assert env.action_space.shape == (5,)
+        assert env.action_space.shape == (8,)
         lo = env.action_space.low
         hi = env.action_space.high
-        assert lo[0] == -3.14 and hi[0] == 3.14      # a1
-        assert lo[1] == -1.57 and hi[1] == 1.57       # a2
-        assert lo[3] == -0.03 and hi[3] == 0.0       # a_l
+        assert lo[0] == -2.8973 and hi[0] == 2.8973  # actuator1
+        assert lo[1] == -1.7628 and hi[1] == 1.7628  # actuator2
+        assert lo[7] == 0.0 and hi[7] == 0.038       # gripper_act
         env.close()
 
     def test_obs_dim_qpos_qvel_sensors(self):
-        """观测维度 = qpos + qvel + sensors 拼接宽（无传感器 10 / 带 17）。"""
+        """观测维度 = 机器人 qpos + qvel + sensors 拼接宽（无 18 / 带 25）。"""
         env = AgentSimEnv(_pick_spec())
-        assert env._obs_dim == 5 + 5
+        assert env._obs_dim == 9 + 9               # panda 7 关节 + 2 指节
         env.close()
         env = AgentSimEnv(_pick_spec(with_sensors=True))
-        assert env._obs_dim == 5 + 5 + 1 + 6        # j1_enc + imu(6)
+        assert env._obs_dim == 9 + 9 + 1 + 6        # j1_enc + imu(6)
         env.close()
 
     def test_multi_robot_flat_action(self):
@@ -108,7 +109,7 @@ class TestResetAndStep:
         env.reset(seed=1)
         assert env.task.max_ticks == 5000
         for _ in range(5000):
-            obs, r, term, trunc, info = env.step(np.zeros(5, dtype=np.float32))
+            obs, r, term, trunc, info = env.step(np.zeros(8, dtype=np.float32))
             if term:
                 break
         assert info["tick"] == 5000 and (trunc or term)
@@ -118,7 +119,7 @@ class TestResetAndStep:
         env = AgentSimEnv(WORLD)
         env.reset()
         from agentsim.errors import WorldError
-        with pytest.raises(WorldError, match="5 维"):
+        with pytest.raises(WorldError, match="8 维"):
             env.step(np.zeros(3, dtype=np.float32))
         env.close()
 
@@ -126,7 +127,7 @@ class TestResetAndStep:
 class TestBitwiseGuard:
     def test_two_episodes_bitwise_identical(self):
         """T4 合并门禁：同动作序列两个 episode，逐 tick qpos 轨迹 array_equal。"""
-        actions = [_reach_push_action(t) for t in range(300)]
+        actions = [_probe_action(t) for t in range(300)]
 
         trajectories = []
         for _ in range(2):
@@ -147,19 +148,19 @@ class TestBitwiseGuard:
 
 
 class TestTaskSuccess:
-    def test_reach_push_terminates_success(self):
-        """T5 端到端：j1 侧扫推 cube 入 zone，terminated=True。"""
-        env = AgentSimEnv(WORLD)
+    def test_success_zone_terminates(self):
+        """T5 端到端：cube 位于成功区内，单步即 terminated=True（抓取序列
+        由控制器层覆盖——test_mcp closed_loop；这里守护 RL env 的终止语义）。"""
+        spec = _pick_spec()
+        for o in spec.scene.objects:
+            if o.name == "cube":
+                o.pos = (0.55, 0.0, 0.86)     # 直接摆进空中成功区
+        env = AgentSimEnv(spec)
         env.reset(seed=0)
-        term = trunc = False
-        for t in range(300):
-            obs, r, term, trunc, info = env.step(_reach_push_action(t))
-            if term:
-                break
+        obs, r, term, trunc, info = env.step(
+            np.zeros(8, dtype=np.float32))
         assert term and not trunc
-        assert info["tick"] < 300
-        cube = env.data.xpos[env.index.objects["cube"]]
-        assert cube[1] >= 0.25                        # cube 越过 zone 的 y 界
+        assert info["tick"] == 1
         env.close()
 
 

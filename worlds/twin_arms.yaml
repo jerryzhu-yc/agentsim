@@ -1,7 +1,9 @@
-name: twin_arms                # M0.3 双机器人演示：两台机械臂各自随机漫步
+name: twin_arms                # 双 Franka Panda + 2FG7：多机器人演示/RL 动作空间
 timestep: 0.002
 ctrl_period: 32
 gravity: [0, 0, -9.81]
+integrator: implicitfast
+impratio: 10
 
 scene:
   floor: {size: [2.0, 2.0], texture: grid}
@@ -23,20 +25,18 @@ scene:
 
 robots:
   - name: arm_a
-    model: ../models/demo_arm.xml
-    pos: [0, 0, 0.05]
-    controller: ../controllers/random_arm.py
-    args: {speed: 0.15}
+    model: zoo://franka_emika_panda
+    pos: [0, 0, 0]
+    gripper: {model: onrobot_2fg7}
   - name: arm_b
-    model: ../models/demo_arm.xml
-    pos: [0.6, 0, 0.05]
-    controller: ../controllers/random_arm.py
-    args: {speed: 0.3}
+    model: zoo://franka_emika_panda
+    pos: [0.6, 0, 0]
+    gripper: {model: onrobot_2fg7}
 
 task:
   reward:
-    - distance: {a: cube_a, b: arm_a/wrist, weight: -1.0}
-    - distance: {a: cube_b, b: arm_b/wrist, weight: -1.0}
+    - distance: {a: cube_a, b: arm_a/link7, weight: -1.0}
+    - distance: {a: cube_b, b: arm_b/link7, weight: -1.0}
   max_ticks: 3000
 
 runtime:

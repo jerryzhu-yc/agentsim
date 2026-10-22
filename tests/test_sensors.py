@@ -9,7 +9,7 @@ import yaml
 from agentsim.errors import WorldError
 from agentsim.kernel.sim import Simulation
 from agentsim.world.builder import build_world
-from agentsim.world.schema import parse_world
+from agentsim.world.schema import parse_world, resolve_zoo_models
 
 ROOT = pathlib.Path(__file__).parent.parent
 WORLD = ROOT / "worlds" / "pick_cube.yaml"
@@ -242,36 +242,37 @@ class TestControllerProtocol:
 # ---------------------------------------------------------------- 触觉与守护（T5/T6）
 
 _SENSORS_ON_ARM = """    sensors:
-      - {name: j1_enc, type: encoder, joint: j1}
-      - {name: j1_tau, type: joint_torque, joint: j1}
-      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}
-      - {name: fl_touch, type: tactile, body: finger_l, pos: [0, 0, 0.05]}
-      - {name: gripper_cam, type: camera, body: wrist, pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}"""
+      - {name: j1_enc, type: encoder, joint: joint1}
+      - {name: j1_tau, type: joint_torque, joint: joint1}
+      - {name: wrist_imu, type: imu, body: link7, pos: [0, 0, 0.02]}
+      - {name: fl_touch, type: tactile, body: gripper/left_finger, pos: [0, 0, 0]}
+      - {name: gripper_cam, type: camera, body: link7, pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}"""
 
 
 def _pick_world(sensors_yaml: str | None):
     """pick_cube + arm 段可选注入 sensors（文本注入，与 Agent 改 YAML 同路径）。"""
     text = WORLD.read_text(encoding="utf-8")
-    anchor = "    controller: ../controllers/pick_place.py   # 侧扫推式相位机"
+    anchor = "    controller: ../controllers/pick_place.py"
     if sensors_yaml:
         text = text.replace(anchor, anchor + "\n" + sensors_yaml)
-    spec = parse_world(yaml.safe_load(text))
+    d = resolve_zoo_models(yaml.safe_load(text))   # zoo:// -> 缓存路径
+    spec = parse_world(d)
     spec.base_dir = ROOT / "worlds"
     return spec
 
 
 class TestTactileAndGuard:
     def test_tactile_fires_during_push(self):
-        """pick_cube 推挤段指板触觉 > 0（T5）。
+        """pick_cube 抓取段指板触觉 > 0（T5）。
 
-        接触审计实证：推 cube 的指板是 finger_r（finger_l 全程不碰 cube）。
+        2FG7 对指夹持 cube：左右指板全程接触被夹物体，任取左指即可触发。
         """
         sensors = """    sensors:
-      - {name: fr_touch, type: tactile, body: finger_r, pos: [0, 0, 0]}"""
+      - {name: fl_touch, type: tactile, body: gripper/left_finger, pos: [0, 0, 0]}"""
         spec = _pick_world(sensors)
         touch_max = 0.0
         with Simulation(spec) as sim:
-            adr, dim = sim.index.robots["arm"].sensors["fr_touch"].parts[0]
+            adr, dim = sim.index.robots["arm"].sensors["fl_touch"].parts[0]
 
             def grab():                       # on_tick：run 线程内 data 一致可读
                 nonlocal touch_max

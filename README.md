@@ -127,14 +127,15 @@ pip install stable-baselines3   # RL 训练示例（examples/train_ppo_go2.py）
 python -m agentsim run worlds/pick_cube.yaml
 ```
 
-输出示例（机械臂侧扫推 cube 入成功区的端到端任务）：
+输出示例（panda+2FG7 抓起桌面 cube、抬入空中成功区的端到端任务）：
 
 ```
-世界 'pick_cube'：1 物体，1 机器人
-运行 238 ticks（墙钟 0.112s，仿真 15.232s）
+世界 'pick_cube'：2 物体，1 机器人
+运行 297 ticks（墙钟 0.212s，仿真 19.008s）
 物理状态: 正常
-任务: 成功（reward 0.0092）
-  cube 最终位置: (+0.510, +0.376, +0.050)
+任务: 成功（reward 0.0074）
+  table 最终位置: (+0.350, +0.000, +0.670)
+  cube 最终位置: (+0.553, -0.002, +0.841)
 ```
 
 加 `--json` 得到机器可读输出，加 `--ticks N` 限定最大步数。
@@ -204,7 +205,7 @@ python -m agentsim run worlds/my_maze.yaml
 | 模板 | 说明 | 主要参数 |
 |---|---|---|
 | `tabletop` | 桌面抓取/搬运：抬升区 + 若干 cube | `--objects`（1~3） |
-| `push` | 推式任务（同 worlds/pick_cube.yaml 布局） | - |
+| `push` | 地面推物：panda+2FG7 把低摩擦 cube 推进成功区（控制器留给 Agent 写） | - |
 | `maze` | 差速车走蛇形迷宫 | `--rows` `--cols`（2~8） |
 | `race` | 多车竞速 | `--lanes`（2~3） |
 | `pallet` | 码垛分区：UR5e+2FG7 把 A 区 N 个 cube 逐个码到 B 区目标格（首次需联网下载一次 UR5e） | `--cubes`（1~6） |
@@ -219,43 +220,50 @@ name: pick_cube
 timestep: 0.002        # 物理步长（秒）
 ctrl_period: 32        # 一个控制 tick 的物理步数
 gravity: [0, 0, -9.81]
+integrator: implicitfast  # 隐式积分：panda 高刚度伺服稳态才准（见下）
+impratio: 10
 
 scene:
   floor:
     size: [2.0, 2.0]      # 半尺寸
-    friction: 0.3         # 滑动摩擦（MuJoCo 语义：接触对取 max，需双方都低才能滑）
+    friction: 1.0         # 滑动摩擦（MuJoCo 语义：接触对取 max，需双方都低才能滑）
   lights:
     - {pos: [0, 0, 3]}
   objects:
-    - name: cube
+    - name: table
       type: box            # box | sphere | cylinder
-      size: [0.03, 0.035, 0.05]   # MJCF 半尺寸
-      pos: [0.635, 0.15, 0.05]
-      mass: 0.05
-      friction: 0.3
+      size: [0.45, 0.35, 0.01]   # MJCF 半尺寸
+      pos: [0.35, 0, 0.67]
+      static: true         # 静态物体（无 freejoint）
+      color: "#6B7280"
+    - name: cube
+      type: box
+      size: [0.03, 0.03, 0.03]
+      pos: [0.55, 0, 0.71]
+      mass: 0.1
+      friction: 1.0
       color: "#F59E0B"
 
 robots:
   - name: arm
-    model: ../models/demo_arm.xml   # MJCF 路径（相对本文件）
-    pos: [0, 0, 0.05]               # root 绝对位姿（模型自带 pos 被吸收）
+    model: zoo://franka_emika_panda   # 模型库引用；也可写 MJCF 相对路径
+    pos: [0, 0, 0.68]                 # root 绝对位姿（模型自带 pos 被吸收）
     controller: ../controllers/pick_place.py   # 控制器脚本（相对本文件）
-    gripper:                         # 可选：末端夹爪（库 key 或自定义 MJCF 路径）
-      model: onrobot_2fg7            # OnRobot 2FG7，适配四臂（见下）
+    gripper: {model: onrobot_2fg7}    # 末端夹爪：库 key（适配四臂，见下）
     sensors:                         # 可选：五类传感器，编译进 MuJoCo
-      - {name: j1_enc, type: encoder, joint: j1}          # 关节位置
-      - {name: j1_tau, type: joint_torque, joint: j1}     # 关节约束力
-      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}   # 6 维
-      - {name: fl_touch, type: tactile, body: finger_l, pos: [0, 0, 0]}
-      - {name: gripper_cam, type: camera, body: wrist,
+      - {name: j1_enc, type: encoder, joint: joint1}       # 关节位置
+      - {name: j1_tau, type: joint_torque, joint: joint1}  # 关节约束力
+      - {name: wrist_imu, type: imu, body: link7, pos: [0, 0, 0.02]}   # 6 维
+      - {name: pad_touch, type: tactile, body: gripper/left_finger, radius: 0.03}
+      - {name: gripper_cam, type: camera, body: link7,
          pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}
 
 task:
   success:                  # 成功判定：body 位置落入 zone
     body: cube
-    zone: {min: [0.35, 0.25, 0.0], max: [0.65, 0.50, 0.12]}
+    zone: {min: [0.49, -0.06, 0.80], max: [0.61, 0.06, 0.92]}
   reward:                   # 距离/zone/接触 三种奖励项
-    - distance: {a: cube, b: wrist, weight: -0.01}
+    - distance: {a: cube, b: arm/link7, weight: -0.01}
     - zone: {body: cube, zone: {min: [...], max: [...]}, weight: 0.01}
   max_ticks: 5000
 
@@ -293,11 +301,11 @@ gripper:
 
 - **适配机型**：`ur5e.xml` / `ur10e.xml` / `xarm7_nohand.xml` / `panda_nohand.xml` 四臂。安装位姿（mount）用同一套标定，以官方 OnRobot workbench 参考场景为黄金标准逐位校准（挂点 site → 夹爪 TCP 变换四臂一致）；未标定的机器人会报清晰错误。
 - **设备命名**：挂爪后夹爪设备带 `gripper/` 前缀并入该机器人设备索引——执行器 `gripper/gripper_act`、两滑动关节 `gripper/left_slide` / `gripper/right_slide`、body `gripper/...`。传感器可引用夹爪手指 body（如 `body: gripper/left_finger`），指尖预置了 `gripper/left_pad_site` / `gripper/right_pad_site`，TCP 为 `gripper/gripper_tcp`。
-- **开合控制**：夹爪是一个 position 执行器，`ctrlrange 0~0.038`（0 全开、0.038 闭合，两指对向耦合）：
+- **开合控制**：夹爪是一个 position 执行器，`ctrlrange 0~0.038`（0.038 全开 / 0 闭合，两指对向耦合）：
 
 ```python
-robot.set("gripper/gripper_act", 0.0)    # 张开
-robot.set("gripper/gripper_act", 0.038)  # 闭合抓取
+robot.set("gripper/gripper_act", 0.038)  # 张开（内间隙 64.8mm）
+robot.set("gripper/gripper_act", 0.0)    # 闭合抓取（内间隙 36mm）
 ```
 
 ## 控制器 API（Webots 风格）
@@ -395,7 +403,63 @@ URDF 与 MJCF 的差异由导入层（`agentsim/world/builder.py` 的 `_load_rob
 - **生成闭环**（`agentsim/agent/scene_agent.py`）：LLM 输出 → 剥围栏提取 YAML → `parse_world` schema 校验 + `build_world` 编译校验 → 失败把可读错误喂回 LLM 重试（默认 3 次）→ 通过即加载
 - **模型引用**：prompt 注入完整模型库清单，LLM 写 `zoo://unitree_go2` 引用 → 本地自动解析成 menagerie 缓存绝对路径（首次联网下载一次）
 - **配置复用**：与 Agent 控制台共用 `~/.agentsim/agent.json`（任意 OpenAI 兼容端点：OpenAI / DeepSeek / GLM / Ollama / vLLM）
+- **抗"MJCF 人设"模型**：给本地模型（如 Ollama）预设过 MJCF/XML 生成器提示词也能用——请求级 system prompt 带人设覆盖指令 + 生成规则明令禁 MJCF/mesh；模型仍输出 XML 时回喂定向纠错（"平台不加载外部 mesh，改用基本体+zoo://"），实测收敛
 - **保留手动路径**：AI 生成不取代手写——模板（`scenegen`）、手写 YAML、导入模型全部保留，AI 只是多一条"说一句话就出场景"的捷径
+
+### 本地模型接入：Ollama 从安装到一句话出场景
+
+全程本地免费、无需任何 API Key。三步：装 Ollama → 拉模型 → GUI 填两项配置。
+
+**第一步 安装 Ollama**
+
+- Windows：官网 https://ollama.com/download 下载 `OllamaSetup.exe` 双击安装（装完自动运行，系统托盘出现羊驼图标）；或 PowerShell 执行 `winget install -e --id Ollama.Ollama`
+- Linux：`curl -fsSL https://ollama.com/install.sh | sh`
+- macOS：`brew install ollama`，或官网下载 dmg
+
+验证服务在跑（任一系统）：
+
+```bash
+ollama list                       # 列出已有模型，不报错即正常
+```
+
+浏览器打开 http://localhost:11434 显示 "Ollama is running" 同样说明正常。
+
+**第二步 拉一个模型**
+
+推荐 `qwen2.5-coder:7b`（约 4.7GB，YAML 遵从度高，消费级显卡/纯 CPU 可跑）：
+
+```bash
+ollama pull qwen2.5-coder:7b
+ollama run qwen2.5-coder:7b 你好    # 出话即就绪
+```
+
+- **不要**给模型预设 MJCF/XML 生成提示词——平台每次请求都注入自己的场景生成规范（schema + 模型库清单 + few-shot 示例），并主动覆盖模型内置人设；已经烘焙过"MJCF 生成器"提示词的模型也能用（定向纠错回喂兜底），但纯白模更干净
+- 机器跑不动 7B 换 `qwen2.5-coder:3b`；想提高一次通过率上 `qwen2.5-coder:14b`。7B 生成世界 YAML 已足够
+
+**第三步 接入平台**
+
+两种方式等价，任选其一：
+
+- **GUI 配置（推荐，全平台一致）**：Agent 页 → "配置"，填三项——`base_url` 填 `http://localhost:11434/v1`（注意带 `/v1`）、`api_key` 留空、`model` 填 `qwen2.5-coder:7b`
+- **手写配置文件**（Linux/macOS 在 `~/.agentsim/agent.json`，Windows 在 `C:\Users\<用户名>\.agentsim\agent.json`）：
+
+```json
+{
+  "base_url": "http://localhost:11434/v1",
+  "model": "qwen2.5-coder:7b"
+}
+```
+
+配置好后两条路立即生效：文件 → AI 生成场景（Ctrl+G）一句话出场景（不满意继续说，"应用修改"增量微调）；Agent 页聊天让 AI 直接调平台工具干活。
+
+**常见问题**
+
+- 生成报"重试 3 次仍失败"——多半模型太小，换 7B 起步；7B 仍频繁失败上 14B
+- 模型输出 MJCF/XML 或引用 `.obj/.dae` mesh——平台自动定向纠错回喂（"平台不加载外部 mesh，改用基本体 + zoo://"），属正常闭环不是错误；**永远不需要**去网上下载任何 mesh 文件，物体用基本体、机器人走 `zoo://` 模型库
+- 报"LLM 服务不可达"——Ollama 没在跑（Windows 看托盘图标），或 `base_url` 忘了带 `/v1`
+- 远程机器上的 Ollama——服务端设 `OLLAMA_HOST=0.0.0.0` 重启服务（Windows 用户环境变量同名），客户端 `base_url` 填 `http://<机器IP>:11434/v1`，防火墙放行 11434 端口
+- Windows 说明——配置文件权限保护（`chmod 0600`）是 Linux 行为，Windows 自动忽略；本地 Ollama 无 api_key，本就不存在泄密面
+
 
 ## 桌面 GUI 智能工作台（M5）
 
@@ -472,7 +536,7 @@ pip install stable-baselines3
 
 ```bash
 python -m pytest tests/ -q
-# 231 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
+# 260 passed —— 覆盖 schema/builder/内核/多机器人/Supervisor 逐位重现/
 #              MCP（含 screenshot/zoo_create/stop/save_world 往返）/
 #              传感器（含 bit 级轨迹守护）/
 #              RL 环境（含逐位一致性守护）/控制器心跳（含跨平台死亡探测）/
@@ -511,12 +575,12 @@ agentsim/
 │   ├── scene_gen.py       # 6 个确定性场景模板（含码垛分区 pallet）
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car）+ grippers/2FG7
-├── controllers/           # 示例控制器（pick_place 侧扫推式相位机等）
+├── controllers/           # 示例控制器（pick_place 桌面抓取相位机等）
 ├── worlds/                # 示例世界（pick_cube、twin_arms）
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
-└── tests/                 # 228 项测试（含 URDF 导入/AI 场景生成/夹爪/码垛）
+└── tests/                 # 260 项测试（含 URDF 导入/AI 场景生成/夹爪/码垛）
 ```
 
 ## Roadmap

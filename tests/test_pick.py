@@ -2,7 +2,7 @@
 
 验收标准（M0 方案 5.6 节）：
 - 相位机控制器抓起 cube、搬运、释放，内核判定 success
-- cube 终态在成功区（释放方位的地面 zone）
+- cube 终态在成功区（空中 hold zone）
 - 全链路逐位可重现
 """
 import pathlib
@@ -14,7 +14,8 @@ from agentsim.world.schema import load_world
 
 ROOT = pathlib.Path(__file__).parent.parent
 WORLD = ROOT / "worlds" / "pick_cube.yaml"
-ZONE_LO, ZONE_HI = (0.46, 0.29, 0.0), (0.61, 0.44, 0.06)
+# 与 pick_cube.yaml task.success.zone 一致的空中成功区（夹起抬升后的 hold 位置）
+ZONE_LO, ZONE_HI = (0.49, -0.06, 0.80), (0.61, 0.06, 0.92)
 
 
 def run_once():

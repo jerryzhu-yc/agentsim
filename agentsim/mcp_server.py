@@ -38,7 +38,7 @@ from agentsim.grippers import GRIPPERS as _GRIPPERS
 from agentsim.kernel.sim import Simulation
 from agentsim.render import encode_png, render_offscreen
 from agentsim.world.schema import load_world as _load_world_file
-from agentsim.world.schema import parse_world
+from agentsim.world.schema import parse_world, resolve_zoo_models
 
 _PROTOCOL = "2024-11-05"
 
@@ -285,6 +285,7 @@ class AgentSimSession:
                 d = yaml.safe_load(text)
             except yaml.YAMLError as e:
                 raise WorldError(f"YAML 语法错误: {e}") from e
+            resolve_zoo_models(d)            # zoo:// -> menagerie 绝对路径
             spec = parse_world(d)
             base = args.get("base_dir") or "."
             spec.base_dir = pathlib.Path(base).resolve()
@@ -561,13 +562,17 @@ class AgentSimSession:
             def abs_of(v):
                 if not v:
                     return v
-                q = pathlib.Path(str(v))
+                s = str(v)
+                if s.startswith("zoo://"):   # 模型库引用非文件路径，原样保留
+                    return s
+                q = pathlib.Path(s)
                 if q.is_absolute():
                     return q.as_posix()
                 return (base / q).resolve().as_posix()
             changed = False
             for r in d.get("robots") or []:
-                if r.get("model") and not pathlib.Path(str(r["model"])) \
+                if r.get("model") and not str(r["model"]).startswith("zoo://") \
+                        and not pathlib.Path(str(r["model"])) \
                         .is_absolute():
                     r["model"] = abs_of(r["model"])
                     changed = True

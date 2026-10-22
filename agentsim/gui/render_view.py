@@ -79,8 +79,15 @@ class RenderModel:
         mujoco.mj_forward(self.model, self.data)
 
         self.cam = mujoco.MjvCamera()
-        self._default_lookat = np.array([0.4, 0.15, 0.25])
-        self._default_distance = 1.8
+        # 空场景/大地面：默认取景对准地面中心并按地面尺寸拉远，
+        # 否则按机械臂作业位取景（近景，利于桌面抓取）
+        floor = spec.scene.floor.size
+        if not spec.robots and not spec.scene.objects:
+            self._default_lookat = np.array([0.0, 0.0, 0.0])
+            self._default_distance = max(floor) * 1.6
+        else:
+            self._default_lookat = np.array([0.4, 0.15, 0.25])
+            self._default_distance = 1.8
         self.cam.lookat[:] = self._default_lookat
         self.cam.distance = self._default_distance
         self.cam.azimuth = 135.0

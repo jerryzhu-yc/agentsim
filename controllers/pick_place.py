@@ -1,83 +1,99 @@
-"""M0.5 端到端任务控制器：j1 侧扫推式相位机（reach -> push -> settle）。
+"""M7 端到端任务控制器：Franka Panda + OnRobot 2FG7 桌面抓取相位机。
 
-几何依据（MuJoCo 真模型 FK + 手算）：
-- psi=j2+j3=90 度（j2 贴上限位 1.57，含 ~0.045 rad 重力稳态下沉）时前臂
-  水平、指板开合沿世界竖直 —— 指板 +y 面是 10x1.6cm 竖直推面
-- 指全开（fl=-0.03/fr=+0.03）时下指板中心 z=wrist_z-0.065 约 0.065，
-  落在地面 cube（z 全高 0.10）中部：推点高于重心 1.5cm，滑动先于倾倒
-  （滑移 0.147N < 倾覆 0.264N）
-- cube 在 (0.635, 0.15)：半径 0.613~0.687 在指板展幅 [0.592, 0.692] 内、
-  又在腕本体最大半径 0.598 之外 —— j1 扫描全程只有指板接触 cube
-- j1 从 0 扫到 0.55：指板面在方位角 ~0.15 追上 cube 的 -y 面后贴板推行
-  （板-指摩擦 1.0 粘住），cube 沿弧线被推到 (0.52, 0.38) 一带，落进
-  task.success.zone
+任务（pick_cube.yaml）：桌面 60mm 方块放 A 区 (0.55, 0, 0.71)，panda 基座
+站桌后缘 (0, 0, 0.68)——approach 高位 -> 5 段直线航点下探 -> grasp ->
+close 闭合 -> 4 段航点抬升 -> lift -> hold，把方块夹起抬到
+(0.55, 0, 0.86) 空中成功区并保持。
 
-控制方式：目标斜坡（独立参考状态限速逼近），避免位置伺服一步到位甩臂。
-push 相位刻意用 1/5 慢速（0.08 rad/s）：接触冲击力估算 ~0.13N，
-低于倾覆阈值，cube 只滑不翻。
+工具姿态（关键，v5 标定）：夹爪 mount 是 site-attach 的 Rot_x(-90°)
+（手指 = gripper body -y -> attachment site +z 法兰法向，实测法兰贴合
+-0.0002）。gripper_tcp site 与 body 系对齐（恒等 quat），故正确的
+"手指竖直向下"姿态是 tcp 系 x->世界 x（开口）、y->世界 +z、z->世界 -y。
+早期标定误把 tcp 的 z 轴当工具轴钉向 -z，夹爪横转 90°（base 碰方块、
+link5 穿透、link7_c 蹭桌全是次生症状）。
+
+几何余量（探针实测 body 系 bbox，手指沿 -y、开合沿 ±x）：
+- 指板内侧面满开（ctrl=0.038）间距 64.8mm，方块 60mm -> 每侧 2.4mm，
+  下探段必须笛卡尔直线；航点链逐段弓高实测 <= 0.65mm
+- 指板竖向跨度 38mm（body y[-0.047,-0.009]），tcp 置 0.72 -> 指板
+  覆盖方块 0.701~0.739；壳体下缘 = tcp+0.0256 = 0.7456，高于方块顶
+  0.74（5.6mm 裕量）；指板最深点 0.701，距桌顶 2.1cm
+- 全相位链（含零位->approach 摆臂）臂/夹爪最低 geom z=0.7009，不蹭桌
+
+夹爪语义（实测）：ctrl=0.038 指板张开（内间隙 64.8mm）、ctrl=0 合至
+内间隙 36mm——先张开套住 60mm 方块再闭合压紧（position 伺服 kp=100，
+方块被挡在 span 60mm 处，每指压力 ~1.35N，摩擦 1.0 下抗 0.98N 重力
+余量 2.7 倍）。
+
+控制方式：目标斜坡（独立参考状态限速逼近），避免位置伺服一步到位
+甩臂把方块从指间震落；close 相位夹爪伺服被方块挡在行程中段、永远
+到不了 ctrl 目标，到位判定不判夹爪、只按 tick 硬超时推进。
 """
 from agentsim.controller import Robot
 
-H = 1.5708
-# (相位, j1, j2, j3, fl, fr, 关节斜坡速度 rad/s)
+# (相位, q1..q7 伺服 ctrl 目标 rad, 夹爪 ctrl m, 关节斜坡速度 rad/s)
+# 关节目标由 6D 位姿 IK 标定（tcp 位置 + 手指朝下 + 开口轴对齐世界 x），
+# 航点链 z 每 2.5~3cm 一个 IK 解（warm start 保同族解），逐段弓高 <= 0.65mm。
+# 在 IK 解上叠加重力前馈 qfrc_bias/kp（panda 伺服 force=kp(ctrl-q)-kv*qdot，
+# 稳态 kp(ctrl-q)=重力矩）：无补偿时稳态下垂 ~0.01 rad -> tcp 偏 5~8mm，
+# 会吃掉指板每侧 2.4mm 余量蹭飞方块；补偿后稳态 tcp 误差 0.00mm。
 PHASES = [
-    ("reach", 0.00, 1.57, 0.0618, -0.03, +0.03, 0.4),
-    ("push",  0.55, 1.57, 0.0618, -0.03, +0.03, 0.08),
+    ("approach", (-1.3176, 0.8125, 1.4687, -2.1172, -0.9286, 2.0114, -1.7435), 0.038, 0.8),
+    ("desc830",  (-1.2793, 0.8376, 1.4001, -2.1300, -0.9798, 2.0574, -1.7195), 0.038, 0.4),
+    ("desc800",  (-1.2404, 0.8697, 1.3332, -2.1353, -1.0365, 2.0972, -1.6933), 0.038, 0.4),
+    ("desc770",  (-1.1983, 0.9039, 1.2638, -2.1328, -1.0934, 2.1361, -1.6674), 0.038, 0.4),
+    ("desc745",  (-1.1635, 0.9333, 1.2070, -2.1259, -1.1395, 2.1672, -1.6469), 0.038, 0.4),
+    ("grasp",    (-1.1302, 0.9647, 1.1527, -2.1151, -1.1852, 2.1961, -1.6271), 0.038, 0.3),
+    ("close",    (-1.1302, 0.9647, 1.1527, -2.1151, -1.1852, 2.1961, -1.6271), 0.000, 0.3),
+    ("rise750",  (-1.1692, 0.9257, 1.2165, -2.1275, -1.1292, 2.1628, -1.6514), 0.000, 0.4),
+    ("rise790",  (-1.2256, 0.8776, 1.3083, -2.1356, -1.0526, 2.1129, -1.6860), 0.000, 0.4),
+    ("rise830",  (-1.2793, 0.8376, 1.4001, -2.1300, -0.9798, 2.0574, -1.7195), 0.000, 0.4),
+    ("lift",     (-1.3176, 0.8125, 1.4687, -2.1172, -0.9286, 2.0114, -1.7435), 0.000, 0.4),
+    ("hold",     (-1.3176, 0.8125, 1.4687, -2.1172, -0.9286, 2.0114, -1.7435), 0.000, 0.0),
 ]
-TOL = 0.06         # 前三关节到位容差（含 j2 约 0.045 rad 重力稳态误差）
+TOL = 0.05        # 7 关节到位容差 rad
 STABLE = 20       # 连续 N tick 在容差内才算到位
 TIMEOUT = 400     # 单相位 tick 上限（防死锁）
-SETTLE_MAX = 600   # 推完后等待静止 tick 上限
-SETTLE_WIN = 30    # 静止判定窗口
-SETTLE_EPS = 1e-3  # 窗口内最大位移
-
-STEP_F = 0.04 * 0.064   # 夹指斜坡每 tick 增量（0.04 m/s）
-TICK = 0.064            # 控制周期（ctrl_period 32 x timestep 0.002）
+CLOSE_TICKS = 90  # close 相位夹爪行程 ~15 tick + 压紧等待，硬超时推进
+HOLD_TICKS = 40   # hold 相位保持时长（供内核 success 判定窗口）
+STEP_F = 0.04     # 夹爪斜坡速度 m/s
+TICK = 0.064      # 控制周期（ctrl_period 32 x timestep 0.002）
 
 robot = Robot()
 phase_i = stable = phase_ticks = 0
-settling = False
-cube_hist: list[list[float]] = []
+ramp_state: list[float] | None = None
 
 
 def ramp(cur: float, tgt: float, step: float) -> float:
     return cur + max(-step, min(step, tgt - cur))
 
 
-# 斜坡参考状态：独立于 qpos 维护（若从 qpos 出发，惯性过冲会带着
-# 目标一起爬升，位置伺服随即失控——实测 j2 冲过目标 0.19 rad）
-ramp_state: list[float] | None = None
-
 while robot.step():
-    if settling:
-        cube_hist.append(list(robot.obs["objects"]["cube"]))
-        if len(cube_hist) > SETTLE_WIN:
-            cube_hist.pop(0)
-            first = cube_hist[0]
-            moved = max(abs(p[k] - first[k])
-                        for p in cube_hist for k in range(3))
-            if moved < SETTLE_EPS or len(cube_hist) >= SETTLE_MAX:
-                break
-        continue
-
-    name, j1, j2, j3, fl, fr, speed = PHASES[phase_i]
+    name, q7, grip, speed = PHASES[phase_i]
     q = robot.obs["qpos"]
     if ramp_state is None:
-        ramp_state = list(q[:5])          # 首个 tick 从实际 qpos 起步
+        # 首 tick 从实际状态起步（7 关节 + 夹爪），顺序对应 set_all
+        ramp_state = list(q[:7]) + [float(q[7] + q[8])]
     step_j = speed * TICK
-    for k, tgt in enumerate((j1, j2, j3, fl, fr)):
-        step = step_j if k < 3 else STEP_F
-        ramp_state[k] = ramp(ramp_state[k], tgt, step)
+    for k, tgt in enumerate(q7):
+        ramp_state[k] = ramp(ramp_state[k], tgt, step_j)
+    ramp_state[7] = ramp(ramp_state[7], grip, STEP_F * TICK)
     robot.set_all(ramp_state)
-    err = max(abs(q[k] - g) for k, g in enumerate((j1, j2, j3)))
+
+    # 到位判定只看 7 个臂关节（夹爪被方块挡住永远到不了目标）
+    err = max(abs(q[k] - g) for k, g in enumerate(q7))
     phase_ticks += 1
     stable = stable + 1 if err < TOL else 0
 
-    if stable >= STABLE or phase_ticks >= TIMEOUT:
-        if name == "push":
-            settling = True               # 推完，转入等待 cube 静止
-        else:
-            phase_i += 1
-            stable = phase_ticks = 0
+    done = stable >= STABLE or phase_ticks >= TIMEOUT
+    if name == "close" and phase_ticks >= CLOSE_TICKS:
+        done = True
+    # hold：稳定保持满 HOLD_TICKS，或臂已稳定到位（stable 达标）即可收尾
+    # ——必须先于下方 done 推进判断，否则 phase_i 会越出 PHASES
+    if name == "hold" and (phase_ticks >= HOLD_TICKS or done):
+        break
+    if done:
+        phase_i += 1
+        stable = phase_ticks = 0
 
 robot.close()

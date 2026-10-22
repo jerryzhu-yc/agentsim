@@ -50,8 +50,8 @@ GRIPPERS: dict[str, dict] = {
         "xml": "onrobot_2fg7.xml",
         "site": "attachment_site",          # 缺省挂点（可在 YAML 覆盖）
         "actuator": "gripper_act",           # 开合执行器（夹爪内短名）
-        "open": 0.0,                         # ctrl=0   全开
-        "close": 0.038,                      # ctrl=0.038 闭合
+        "open": 0.038,                       # ctrl=0.038 全开（内间隙 64.8mm）
+        "close": 0.0,                        # ctrl=0 闭合（内间隙 36mm）
         "joints": ("left_slide", "right_slide"),
         # key = 机器人模型文件 basename；未列出的机器人报清晰错误而非静默错挂
         "mounts": {

@@ -47,7 +47,7 @@ class TestAgentLoop:
             info = s.call_tool("load_world", {"yaml_path": str(WORLD)})
             assert info["world"] == "pick_cube"
             assert info["robots"] == ["arm"]
-            assert info["objects"] == ["cube"]
+            assert info["objects"] == ["table", "cube"]
 
             text = s.call_tool("read_world", {})
             assert "name: pick_cube" in text
@@ -56,25 +56,32 @@ class TestAgentLoop:
             arm = m["robots"][0]
             assert arm["name"] == "arm"
             assert [a["name"] for a in arm["actuators"]] == \
-                ["a1", "a2", "a3", "a_l", "a_r"]
-            assert arm["actuators"][0]["ctrlrange"] == [-3.14, 3.14]
-            assert {j["name"] for j in arm["joints"]} >= {"j1", "j2", "j3"}
+                ["actuator1", "actuator2", "actuator3", "actuator4",
+                 "actuator5", "actuator6", "actuator7",
+                 "gripper/gripper_act"]
+            assert arm["actuators"][0]["ctrlrange"] == [-2.8973, 2.8973]
+            assert {j["name"] for j in arm["joints"]} >= \
+                {"joint1", "joint2", "joint3"}
 
             stats = s.call_tool("run", {})
             assert stats["success"] is True
-            assert stats["objects"]["cube"][1] > 0.25   # 被推进成功区
+            assert stats["objects"]["cube"][2] > 0.80   # 被夹进空中成功区
 
             obs = s.call_tool("get_observation", {})
             assert obs["task"]["success"] is True
-            assert len(obs["robots"]["arm"]["qpos"]) == 5
+            assert len(obs["robots"]["arm"]["qpos"]) == 9
         finally:
             s.close()
 
     def test_edit_world_reload(self):
-        """Agent 改 YAML（去控制器 + cube 挪进成功区）-> yaml_text 重载"""
+        """Agent 改 YAML（去控制器 + 成功区下移到桌面）-> yaml_text 重载"""
         text = WORLD.read_text(encoding="utf-8")
         text = text.replace("controller: ../controllers/pick_place.py", "controller:")
-        text = text.replace("pos: [0.635, 0.15, 0.05]", "pos: [0.40, 0.30, 0.05]")
+        # 空中 zone 改到桌面：cube 静置桌上即在区内（run 收尾才判终态，
+        # 空中 zone 下 cube 坠落 0.64s 早已出区）
+        text = text.replace(
+            "zone: {min: [0.49, -0.06, 0.80], max: [0.61, 0.06, 0.92]}",
+            "zone: {min: [0.49, -0.06, 0.68], max: [0.61, 0.06, 0.80]}")
         text = text.replace("max_ticks: 5000", "max_ticks: 10")
         s = AgentSimSession()
         try:
@@ -99,7 +106,7 @@ class TestAgentLoop:
                 r["controller"] = None
             for o in d["scene"]["objects"]:
                 if o["name"] == "cube":
-                    o["pos"] = [0.42, 0.31, 0.12]
+                    o["pos"] = [0.55, 0.02, 0.71]
             new_text = yaml.safe_dump(d, allow_unicode=True, sort_keys=False)
             s.call_tool("load_world", {"yaml_text": new_text,
                                        "base_dir": str(ROOT / "worlds")})
@@ -110,7 +117,7 @@ class TestAgentLoop:
             # 重开保存的文件：修改还在
             s.call_tool("load_world", {"yaml_path": str(out)})
             obs = s.call_tool("get_observation", {})
-            assert obs["objects"]["cube"]["pos"][:3] == [0.42, 0.31, 0.12]
+            assert obs["objects"]["cube"]["pos"][:3] == [0.55, 0.02, 0.71]
             # world_path 追踪：yaml_text 重载不换来源文件，缺省保存回原文件
             s.call_tool("load_world", {"yaml_path": str(WORLD)})
             s.call_tool("load_world", {"yaml_text": new_text,
@@ -416,13 +423,14 @@ class TestStdioProtocol:
 def _world_with_sensors():
     """pick_cube + arm 传感器全套（含相机），Agent 改 YAML 的同一注入路径。"""
     text = WORLD.read_text(encoding="utf-8")
-    anchor = "    controller: ../controllers/pick_place.py   # 侧扫推式相位机"
+    anchor = "    controller: ../controllers/pick_place.py"
     sensors = (
         "\n    sensors:\n"
-        "      - {name: j1_enc, type: encoder, joint: j1}\n"
-        "      - {name: wrist_imu, type: imu, body: wrist, pos: [0, 0, 0.02]}\n"
-        "      - {name: fl_touch, type: tactile, body: finger_l, pos: [0, 0, 0]}\n"
-        "      - {name: gripper_cam, type: camera, body: wrist,"
+        "      - {name: j1_enc, type: encoder, joint: joint1}\n"
+        "      - {name: wrist_imu, type: imu, body: link7, pos: [0, 0, 0.02]}\n"
+        "      - {name: fl_touch, type: tactile,"
+        " body: gripper/left_finger, pos: [0, 0, 0]}\n"
+        "      - {name: gripper_cam, type: camera, body: link7,"
         " pos: [0, 0.06, 0.10], quat: [0.7071, 0.7071, 0, 0]}")
     return text.replace(anchor, anchor + sensors)
 

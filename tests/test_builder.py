@@ -23,11 +23,12 @@ def built():
 class TestCompile:
     def test_model_counts(self, built):
         _, model, _ = built
-        # worldbody + cube + (base, link1, link2, wrist, finger_l, finger_r)
-        assert model.nbody == 1 + 1 + 6
-        # cube freejoint + 3 hinge + 2 slide
-        assert model.njnt == 6
-        assert model.nu == 5      # demo_arm 的 5 个执行器
+        # worldbody + table + cube + (link0..link7, attachment,
+        #   gripper_base, left_finger, right_finger)
+        assert model.nbody == 15
+        # cube freejoint + panda 7 hinge + gripper 2 slide
+        assert model.njnt == 10
+        assert model.nu == 8      # panda 7 执行器 + gripper_act
 
     def test_options_applied(self, built):
         spec, model, _ = built
@@ -44,35 +45,42 @@ class TestCompile:
 class TestNameIndex:
     def test_objects(self, built):
         _, model, index = built
-        assert index.objects == {"cube": mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_BODY, "cube")}
+        assert index.objects == {
+            "table": mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, "table"),
+            "cube": mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, "cube"),
+        }
 
     def test_robot_actuators(self, built):
         _, _, index = built
         arm = index.robots["arm"]
-        assert set(arm.actuators) == {"a1", "a2", "a3", "a_l", "a_r"}
+        assert set(arm.actuators) == {
+            "actuator1", "actuator2", "actuator3", "actuator4",
+            "actuator5", "actuator6", "actuator7", "gripper/gripper_act",
+        }
         # id 是全前缀名的 id
-        assert arm.actuators["a1"] == 0
+        assert arm.actuators["actuator1"] == 0
 
     def test_robot_bodies_unprefixed(self, built):
         _, _, index = built
         arm = index.robots["arm"]
-        assert "wrist" in arm.bodies
-        assert "finger_l" in arm.bodies
+        assert "link7" in arm.bodies
+        assert "gripper/left_finger" in arm.bodies
 
     def test_resolve_body_all_ways(self, built):
         _, _, index = built
         assert index.resolve_body("cube") == index.objects["cube"]
-        assert index.resolve_body("arm/wrist") in index.bodies.values()
+        assert index.resolve_body("arm/link7") in index.bodies.values()
         # 无前缀引用机器人内部 body（自动补 arm/）
-        assert index.resolve_body("wrist") == index.bodies["arm/wrist"]
+        assert index.resolve_body("link7") == index.bodies["arm/link7"]
 
     def test_resolve_body_error_lists_candidates(self, built):
         _, _, index = built
         with pytest.raises(WorldError) as e:
             index.resolve_body("ghost")
         msg = str(e.value)
-        assert "ghost" in msg and "cube" in msg and "arm/wrist" in msg
+        assert "ghost" in msg and "cube" in msg and "arm/link7" in msg
 
 
 class TestTaskResolution:
@@ -80,18 +88,18 @@ class TestTaskResolution:
         spec, _, index = built
         rt = resolve_task(spec.task, index)
         assert rt.success_body == index.objects["cube"]
-        assert rt.success_min == (0.35, 0.25, 0.0)
-        assert rt.success_max == (0.65, 0.50, 0.12)
+        assert rt.success_min == (0.49, -0.06, 0.80)
+        assert rt.success_max == (0.61, 0.06, 0.92)
         assert len(rt.rewards) == 2
         kind, a, b, w = rt.rewards[0]
         assert kind == "distance"
         assert a == index.objects["cube"]
-        assert b == index.bodies["arm/wrist"]
+        assert b == index.bodies["arm/link7"]
         assert w == -0.01
         kind, a, zone, w = rt.rewards[1]
         assert kind == "zone"
         assert a == index.objects["cube"]
-        assert zone == ((0.35, 0.25, 0.0), (0.65, 0.50, 0.12))
+        assert zone == ((0.49, -0.06, 0.80), (0.61, 0.06, 0.92))
         assert w == 0.01
         assert rt.max_ticks == 5000
 
@@ -111,7 +119,7 @@ class TestRobotPlacement:
         _, model, _ = built
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
-        assert np.allclose(data.body("arm/base").xpos, [0, 0, 0.05])
+        assert np.allclose(data.body("arm/link0").xpos, [0, 0, 0.68])
 
     def test_offset_attach(self):
         """机器人放到非原点，前缀 body 位置正确"""
@@ -156,14 +164,14 @@ class TestRobotPlacement:
 
 class TestSmoke:
     def test_1000_step_stable(self, built):
-        """物理冒烟：1000 步无 NaN，方块安稳落在地面上"""
+        """物理冒烟：1000 步无 NaN，方块安稳落在桌面上"""
         _, model, _ = built
         data = mujoco.MjData(model)
         for _ in range(1000):
             mujoco.mj_step(model, data)
         assert np.all(np.isfinite(data.qpos))
         cube_z = data.body("cube").xpos[2]
-        assert 0.049 < cube_z < 0.052   # 半尺寸 0.05，静止在地面
+        assert 0.70 < cube_z < 0.72   # 桌顶 0.68 + 半高 0.03，静止在桌面
 
     def test_two_robots_same_model_no_clash(self):
         """同模型双机器人：前缀隔离，名字不冲突"""
@@ -186,3 +194,22 @@ class TestSmoke:
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
         assert np.allclose(data.body("b/base").xpos, [0.6, 0, 0.05])
+
+
+class TestEmptyWorld:
+    """任务 D：GUI 启动默认加载的纯空场景 + 白天 skybox 背景。"""
+
+    def test_empty_world_builds_runs_skybox(self):
+        spec = load_world(ROOT / "worlds" / "empty.yaml")
+        assert spec.scene.floor.size == (5.0, 5.0)
+        assert spec.scene.objects == []
+        assert spec.robots == []
+        model, index = build_world(spec)
+        assert index.objects == {} and index.robots == {}
+        # 白天背景：builder 给每个世界注入渐变 skybox 纹理
+        types = {int(t) for t in model.tex_type}
+        assert int(mujoco.mjtTexture.mjTEXTURE_SKYBOX) in types
+        data = mujoco.MjData(model)
+        for _ in range(100):
+            mujoco.mj_step(model, data)
+        assert np.all(np.isfinite(data.qpos))

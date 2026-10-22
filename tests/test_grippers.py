@@ -81,7 +81,7 @@ def test_gripper_actuator_count(label, key):
 
 
 def test_gripper_closes_and_opens():
-    """ur5e + 2FG7：ctrl=0.038 闭合（两 slide qpos>0.015），回 0 张开。"""
+    """ur5e + 2FG7：ctrl=0.038 张开（两 slide qpos→0.019），回 0 闭合。"""
     xml = _menagerie_xml("universal_robots_ur5e")
     spec = parse_world(_world_dict(xml))
     model, index = build_world(spec)
@@ -104,19 +104,19 @@ def test_gripper_closes_and_opens():
             data.ctrl[aid] = data.qpos[model.jnt_qposadr[jid]]
 
     l0, r0 = slide_qpos()
-    assert abs(l0) < 1e-6 and abs(r0) < 1e-6     # 出生全开
-
-    data.ctrl[grip_act] = GRIPPERS["onrobot_2fg7"]["close"]
-    for _ in range(400):
-        mujoco.mj_step(model, data)
-    lc, rc = slide_qpos()
-    assert lc > 0.015 and rc > 0.015, (lc, rc)    # 实际闭合到位
+    assert abs(l0) < 1e-6 and abs(r0) < 1e-6     # 出生零位（闭合姿态，ctrl=0）
 
     data.ctrl[grip_act] = GRIPPERS["onrobot_2fg7"]["open"]
     for _ in range(400):
         mujoco.mj_step(model, data)
     lo, ro = slide_qpos()
-    assert lo < 0.005 and ro < 0.005, (lo, ro)    # 重新张开
+    assert lo > 0.015 and ro > 0.015, (lo, ro)    # ctrl=0.038 两指张开到位
+
+    data.ctrl[grip_act] = GRIPPERS["onrobot_2fg7"]["close"]
+    for _ in range(400):
+        mujoco.mj_step(model, data)
+    lc, rc = slide_qpos()
+    assert lc < 0.005 and rc < 0.005, (lc, rc)    # 回 ctrl=0 重新并拢
 
 
 def test_tactile_sensor_on_gripper_finger():

@@ -28,17 +28,22 @@ class TestValidWorld:
         assert spec.ctrl_period == 32
         assert spec.gravity == (0.0, 0.0, -9.81)
 
-        cube = spec.scene.objects[0]
+        table = spec.scene.objects[0]
+        assert table.name == "table"
+        assert table.static is True
+
+        cube = spec.scene.objects[1]
         assert cube.name == "cube"
         assert cube.type == "box"
-        assert cube.size == (0.03, 0.035, 0.05)
-        assert cube.mass == 0.05
-        assert cube.friction == 0.3
-        assert spec.scene.floor.friction == 0.3
+        assert cube.size == (0.03, 0.03, 0.03)
+        assert cube.mass == 0.1
+        assert cube.friction == 1.0
+        assert spec.scene.floor.friction == 1.0
 
         arm = spec.robots[0]
         assert arm.name == "arm"
-        assert arm.model.endswith("models/demo_arm.xml")
+        # zoo://franka_emika_panda -> menagerie 缓存 panda_nohand.xml
+        assert arm.model.endswith("panda_nohand.xml")
         assert arm.controller.endswith("pick_place.py")
         assert arm.args == {}
 

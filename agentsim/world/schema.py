@@ -498,8 +498,34 @@ def parse_world(d: dict, path: str = "world") -> WorldSpec:
                      scene=scene, robots=robots, task=task, runtime=runtime)
 
 
+def resolve_zoo_models(d: dict, on_download=None) -> dict:
+    """把 robots[].model 的 zoo://key 替换成 menagerie 缓存绝对路径。
+
+    zoo:// 是模型库一等公民引用：AI 生成、模板、手写世界 YAML 通用，
+    load_world 与 MCP load_world(yaml_text) 都在此解析（首次联网下载
+    一次，之后永久离线）。
+    on_download(key)：下载前回调（进度提示），load_world 路径静默。
+    就地修改并返回 d（链式）。未知 key 抛 WorldError（可读）。
+    路径统一正斜杠（as_posix）：Windows 反斜杠进 YAML 也安全。
+    """
+    from agentsim.zoo import MODELS, ensure_model
+    for rd in d.get("robots") or []:
+        model = rd.get("model", "")
+        if not str(model).startswith("zoo://"):
+            continue
+        key = str(model)[len("zoo://"):]
+        if key not in MODELS:
+            raise WorldError(
+                f"引用了未知模型库 key '{key}'，可用: {sorted(MODELS)}")
+        if on_download:
+            on_download(key)
+        rd["model"] = pathlib.Path(ensure_model(key)).as_posix()
+    return d
+
+
 def load_world(yaml_path: str | pathlib.Path) -> WorldSpec:
-    """从 YAML 文件加载世界。路径（model/controller）按世界文件所在目录解析。"""
+    """从 YAML 文件加载世界。路径（model/controller）按世界文件所在目录解析；
+    robots[].model 支持 zoo://<key> 模型库引用（首次自动下载）。"""
     yaml_path = pathlib.Path(yaml_path)
     if not yaml_path.exists():
         raise WorldError(f"世界文件不存在: {yaml_path}")
@@ -509,6 +535,7 @@ def load_world(yaml_path: str | pathlib.Path) -> WorldSpec:
         raise WorldError(f"[{yaml_path}] YAML 语法错误: {e}") from e
     if d is None:
         raise WorldError(f"[{yaml_path}] 世界文件为空")
+    resolve_zoo_models(d)                # zoo:// -> menagerie 绝对路径
     spec = parse_world(d, str(yaml_path))
     spec.base_dir = yaml_path.resolve().parent
     return spec

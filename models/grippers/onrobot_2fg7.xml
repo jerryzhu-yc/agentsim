@@ -10,7 +10,7 @@
     （合并 spec 编译时相对路径会失效，与 zoo._write_demo_model 同款处理）
 
   运动学：left/right 两条 slide（range 0~0.019）由 fixed tendon 耦合并联，
-  单个 position actuator gripper_act（ctrlrange 0~0.038：0 开 / 0.038 合）。
+  单个 position actuator gripper_act（ctrlrange 0~0.038：0.038 全开 / 0 闭合）。
   attach 后全名 "<robot>/gripper/gripper_act"，控制器 robot.set 即可开合。
 -->
 <mujoco model="onrobot_2fg7">

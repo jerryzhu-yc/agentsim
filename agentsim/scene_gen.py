@@ -34,11 +34,21 @@ def _rel(target: pathlib.Path, base: pathlib.Path) -> str:
 
 
 def _robot(name: str, model_file: str, base: pathlib.Path,
-           pos: tuple, controller: str | None = None) -> dict:
-    r = {"name": name, "model": _rel(MODELS / model_file, base),
+           pos: tuple, controller: str | None = None,
+           gripper: str | None = None) -> dict:
+    """组装 robot 段。model_file：仓库 models/ 下文件名，或 zoo://key
+    模型库引用（load_world 时解析成 menagerie 缓存绝对路径，产物
+    跨机器可移植，首次使用自动下载）。"""
+    if model_file.startswith("zoo://"):
+        model = model_file
+    else:
+        model = _rel(MODELS / model_file, base)
+    r = {"name": name, "model": model,
          "pos": [round(float(v), 4) for v in pos]}
     if controller:
         r["controller"] = _rel(CONTROLLERS / controller, base)
+    if gripper:
+        r["gripper"] = {"model": gripper}
     return r
 
 
@@ -95,32 +105,41 @@ def _tpl_tabletop(p, base):
     task = {
         "success": {"body": "cube_0", "zone": zone},
         "reward": [
-            {"distance": {"a": "cube_0", "b": "wrist", "weight": -0.01}},
+            {"distance": {"a": "cube_0", "b": "arm/link7", "weight": -0.01}},
             {"zone": {"body": "cube_0", "zone": zone, "weight": 0.01}},
         ],
         "max_ticks": 5000,
     }
-    return _base_world(f"tabletop_{n}", [table] + cubes,
-                       [_robot("arm", "demo_arm.xml", base, (0, 0, 0.05))], task)
+    w = _base_world(f"tabletop_{n}", [table] + cubes,
+                    [_robot("arm", "zoo://franka_emika_panda", base, (0, 0, 0),
+                            gripper="onrobot_2fg7")], task)
+    # panda 高刚度位置伺服（kp=4500）依赖隐式积分（同 worlds/pick_cube.yaml）
+    w["integrator"] = "implicitfast"
+    w["impratio"] = 10
+    return w
 
 
 def _tpl_push(p, base):
-    """侧扫推式（M0.5 已验证布局的参数化再生）：机械臂把地面立柱推进成功区"""
-    cube = _obj("cube", (0.03, 0.035, 0.05), (0.635, 0.15, 0.05),
+    """地面推物：panda+2FG7 把低摩擦 cube 沿 +y 推进成功区（无绑定控制器，
+    控制律留给 Agent/用户写）"""
+    cube = _obj("cube", (0.03, 0.035, 0.05), (0.55, 0.15, 0.05),
                 "#F59E0B", mass=0.05, friction=0.3)
-    zone = {"min": [0.35, 0.25, 0.0], "max": [0.65, 0.50, 0.12]}
+    zone = {"min": [0.40, 0.26, 0.0], "max": [0.65, 0.50, 0.14]}
     task = {
         "success": {"body": "cube", "zone": zone},
         "reward": [
-            {"distance": {"a": "cube", "b": "wrist", "weight": -0.01}},
+            {"distance": {"a": "cube", "b": "arm/link7", "weight": -0.01}},
             {"zone": {"body": "cube", "zone": zone, "weight": 0.01}},
         ],
         "max_ticks": 5000,
     }
     w = _base_world("push_cube", [cube],
-                    [_robot("arm", "demo_arm.xml", base, (0, 0, 0.05),
-                            controller="pick_place.py")], task)
+                    [_robot("arm", "zoo://franka_emika_panda", base, (0, 0, 0),
+                            gripper="onrobot_2fg7")], task)
     w["scene"]["floor"]["friction"] = 0.3
+    # panda 高刚度位置伺服（kp=4500）依赖隐式积分（同 worlds/pick_cube.yaml）
+    w["integrator"] = "implicitfast"
+    w["impratio"] = 10
     return w
 
 
@@ -206,10 +225,16 @@ def _tpl_empty(p, base):
         raise WorldError(f"参数 robot 需要是 arm/diff_car/none，实际是: {kind!r}")
     robots = []
     if kind == "arm":
-        robots.append(_robot("arm", "demo_arm.xml", base, (0, 0, 0.05)))
+        robots.append(_robot("arm", "zoo://franka_emika_panda", base,
+                             (0, 0, 0), gripper="onrobot_2fg7"))
     elif kind == "diff_car":
         robots.append(_robot("car", "diff_car.xml", base, (0, 0, 0.045)))
-    return _base_world(f"empty_{kind}", [], robots)
+    w = _base_world(f"empty_{kind}", [], robots)
+    if kind == "arm":
+        # panda 高刚度位置伺服（kp=4500）依赖隐式积分（同 worlds/pick_cube.yaml）
+        w["integrator"] = "implicitfast"
+        w["impratio"] = 10
+    return w
 
 
 def _tpl_pallet(p, base):
@@ -222,7 +247,6 @@ def _tpl_pallet(p, base):
     """
     n = p["cubes"]
     _check_range("cubes", n, 1, 6)
-    from agentsim.zoo import ensure_model   # 懒加载：首次触发 menagerie 下载
 
     top_z = 0.75
     half, cs, gap = 0.025, 0.025, 0.11      # cube 半边长 / 目标格间距
@@ -258,7 +282,7 @@ def _tpl_pallet(p, base):
     }
     arm = {
         "name": "arm",
-        "model": str(ensure_model("universal_robots_ur5e")),
+        "model": "zoo://universal_robots_ur5e",
         "pos": [0, 0, top_z],
         "gripper": {"model": "onrobot_2fg7"},
     }
@@ -273,7 +297,7 @@ def _tpl_pallet(p, base):
 TEMPLATES = {
     "tabletop": ("机械臂桌面抓取：桌面 + N 个 cube + 抬升成功区",
                  {"objects": (int, 2, "桌面 cube 数 1~3")}, _tpl_tabletop),
-    "push": ("侧扫推式（M0.5 验证布局的再生）：把地面立柱推进成功区",
+    "push": ("地面推物：panda+2FG7 把低摩擦 cube 推进成功区（控制器留给 Agent 写）",
              {}, _tpl_push),
     "maze": ("差速车蛇形迷宫：蛇形通道走到左上目标格",
              {"rows": (int, 3, "行数 2~8"),

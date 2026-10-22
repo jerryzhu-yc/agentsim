@@ -133,6 +133,14 @@ def _resolve_path(base: pathlib.Path, rel: str, what: str) -> pathlib.Path:
 
 def _build_scene(spec: WorldSpec, mj: mujoco.MjSpec):
     sc = spec.scene
+    # 白天背景：内置渐变 skybox（上方浅天蓝，地平方向近白）。
+    # MuJoCo 3.13 classic 渲染器清屏色硬编码为黑色，只有 skybox 能给出非黑背景。
+    mj.add_texture(
+        name="sky", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX,
+        builtin=mujoco.mjtBuiltin.mjBUILTIN_GRADIENT,
+        rgb1=[0.72, 0.82, 0.92], rgb2=[0.97, 0.98, 1.0],
+        width=512, height=3072,
+    )
     # 地面
     mj.worldbody.add_geom(
         name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
