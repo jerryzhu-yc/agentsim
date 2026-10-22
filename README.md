@@ -11,7 +11,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
         └───────────────┬──────────────────────────────┘
                         │ stdio JSON-RPC (MCP)
         ┌───────────────▼──────────────────────────────┐
-        │           MCP 工具层（9 个工具）              │
+        │           MCP 工具层（12 个工具）             │
         │  load_world / run / get_observation / ...    │
         └───────────────┬──────────────────────────────┘
                         │
@@ -43,7 +43,7 @@ AgentSim 把"世界"做成代码（World as Code：一份 YAML 即一个完整�
 
 ## 安装
 
-要求 Python 3.10+。
+要求 Python 3.10+。**Linux / macOS** 照下面三行装；**Windows 用户直接跳 [Windows 部署](#windows-部署)**（含双击启动、快捷方式与 FAQ）：
 
 ```bash
 git clone https://github.com/jerryzhu-yc/agentsim.git
@@ -68,7 +68,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-所有依赖（mujoco / PySide6 / pyzmq / numpy）在 Windows 均有官方预编译 wheel，无需编译器。
+所有依赖（mujoco / PySide6 / pyzmq / numpy / mujoco-menagerie 等）在 Windows 均有官方预编译 wheel，无需编译器。
 
 **3. 验证安装**：
 
@@ -109,7 +109,14 @@ pip install stable-baselines3   # RL 训练示例（examples/train_ppo_go2.py）
 
 ### Linux 部署
 
-按上面"安装"章节建好环境后，仓库根自带 `start.sh` 启动脚本：自动按 `.venv` → `venv` → PATH 里的 `python3` 顺序定位解释器，所有 CLI 子命令原样透传，无需手动激活 venv：
+按上面"安装"章节建好环境后，先验证再上路：
+
+```bash
+python -m pytest tests/ -q               # 全绿即环境就绪（266 项）
+./start.sh run worlds/pick_cube.yaml     # 跑通一个内置任务（输出见"快速开始"）
+```
+
+仓库根自带 `start.sh` 启动脚本：自动按 `.venv` → `venv` → PATH 里的 `python3` 顺序定位解释器，所有 CLI 子命令原样透传，无需手动激活 venv：
 
 ```bash
 ./start.sh gui                            # 桌面工作台
@@ -174,7 +181,7 @@ python -m agentsim run worlds/pick_cube.yaml
 运行 297 ticks（墙钟 0.212s，仿真 19.008s）
 物理状态: 正常
 任务: 成功（reward 0.0074）
-  table 最终位置: (+0.350, +0.000, +0.670)
+  table 最终位置: (+0.325, +0.000, +0.650)
   cube 最终位置: (+0.553, -0.002, +0.841)
 ```
 
@@ -186,12 +193,13 @@ python -m agentsim run worlds/pick_cube.yaml
 python -m agentsim mcp
 ```
 
-在支持 MCP 的客户端里把它注册为 stdio 服务器，Agent 即可使用 9 个工具完成闭环：
+在支持 MCP 的客户端里把它注册为 stdio 服务器，Agent 即可使用 12 个工具完成闭环：
 
 | 工具 | 说明 |
 |---|---|
 | `load_world` | 加载世界（`yaml_path` 或 `yaml_text` 二选一），整体替换当前世界 |
 | `run` | 推进仿真并返回摘要（ticks / success / reward / 物体终位）；`ticks=N` 只推进 N 步 |
+| `stop` | run 进行中提前收尾：控制器正常退出、已跑轨迹保留，之后照常 reset / 继续跑 |
 | `get_observation` | 当前完整观察量：qpos / qvel / ctrl / body 位置 + 传感器读数 + 任务状态 |
 | `get_robot_manifest` | 机器人设备清单：执行器、关节限位、挂点 site、body 名、传感器、相机、当前夹爪（含开合范围）+ 可用夹爪库目录 |
 | `screenshot` | 把当前状态渲染成 PNG：缺省自由机位返回 image content，`camera` 指定已声明相机，`path` 写盘 |
@@ -208,9 +216,10 @@ Agent 的标准闭环：`read_world` → 修改 YAML → `load_world(yaml_text)`
 ### 3. 桌面 GUI 实时可视化
 
 ```bash
-pip install PySide6-Essentials   # GUI 可选依赖
 python -m agentsim gui
 ```
+
+（GUI 依赖 PySide6 已随 `requirements.txt` 装好，直接启动即可。）
 
 > Windows 用户可免终端：双击仓库根的 `start.bat`，或先跑一次 `create_desktop_shortcut.bat` 生成桌面图标（见 [Windows 部署](#windows-部署)）。
 
@@ -554,7 +563,7 @@ GUI 右侧第五个 tab"Agent"：聊天式下达任务给 AI（OpenAI 兼容 cha
 
 配置保存到 `~/.agentsim/agent.json`，`chmod 0600` 保护 api_key。配好后聊天下达任务（Enter 发送，Shift+Enter 换行）：
 
-- Agent 拿到的是 OpenAI function calling 格式工具清单（`bridge.to_openai_tools`）——MCP 的 11 个工具（含 `stop` 停止仿真）+ 2 个本地文件工具（`write_file`/`read_file`，限定在世界目录内防越界）
+- Agent 拿到的是 OpenAI function calling 格式工具清单（`bridge.to_openai_tools`）——MCP 的 12 个工具（含 `stop` 停止仿真）+ 2 个本地文件工具（`write_file`/`read_file`，限定在世界目录内防越界）
 - 工具循环：Agent 返回文本 → 显示在聊天框；返回 tool_calls → MCP 同步等回复（QEventLoop + 30s QTimer 兜底）→ 显示工具调用与结果 → 继续下一轮直到 Agent 不再调工具
 - 系统提示词包含：身份（机器人仿真助手）、当前世界名、所有工具清单（MCP + 本地）、建议工作流（read_world → load_world → run → get_observation）
 
@@ -566,7 +575,7 @@ GUI 右侧第五个 tab"Agent"：聊天式下达任务给 AI（OpenAI 兼容 cha
 
 ```bash
 pip install stable-baselines3
-~/python examples/train_ppo_go2.py
+python examples/train_ppo_go2.py
 # 200k 步训练，输出 models/ppo_go2.zip
 ```
 
@@ -616,7 +625,7 @@ agentsim/
 │   └── cli.py             # run / mcp / gui / scenegen 命令行
 ├── models/                # 机器人 MJCF（demo_arm 三指臂、diff_car）+ grippers/2FG7
 ├── controllers/           # 示例控制器（pick_place 桌面抓取相位机等）
-├── worlds/                # 示例世界（pick_cube、twin_arms）
+├── worlds/                # 示例世界（pick_cube、twin_arms、empty——GUI 启动默认加载）
 ├── examples/             # PPO 训练示例（train_ppo_go2.py，sb3 可选依赖）
 ├── start.bat / create_desktop_shortcut.bat / agentsim.ico
 │                            # Windows 双击启动 + 桌面快捷方式（项目图标）
